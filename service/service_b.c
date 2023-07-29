@@ -20,9 +20,6 @@ void* service_fn(void* fn, void* args) {
 int main(int argc, char* argv[]) {
   client_t* client = client_regist("serviceb");
 
-  printf("client %x\n", client);
-  printf("client id %d\n", client->id);
-
   client_run(client, service_fn);
 
   return 0;
