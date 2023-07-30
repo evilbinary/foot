@@ -57,3 +57,15 @@ env.Program('serviceb', source,
     CXXFLAGS=cflags+' $CXXFLAGS $LIBCFLAGS '
             )
 
+
+source = ['vfsd.c']
+
+env.Program('vfsd', source,
+    LIBS=libs+env.get('LIBS'),
+    LIBPATH=libpath +env['LIBPATH'],
+    CPPPATH=include+ env['CPPPATH'] ,
+    CFLAGS=cflags+' $CFLAGS $LIBCFLAGS ',
+    CXXFLAGS=cflags+' $CXXFLAGS $LIBCFLAGS '
+            )
+
+
