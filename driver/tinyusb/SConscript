@@ -64,6 +64,8 @@ include+=[
     'examples/dual/host_hid_to_device_cdc/src/'
 ]
 
+build_tinyusb=False
+
 if env['PLATFORM']=='raspi2':
 
     include+=[
@@ -84,14 +86,16 @@ if env['PLATFORM']=='raspi2':
     source += Glob('src/portable/raspberrypi/rp2/*.c')
 
     cflags +=' -std=c99 -DCFG_TUSB_MCU=OPT_MCU_BCM2835 -DBCM_VERSION=2835 -D__ARM_ARCH -D__ARM_ARCH=6 '
+    build_tinyusb=True
 else:
     print('todo support')
     pass
 
-env.Program('tinyusb', source,
-            LIBS=libs+env.get('LIBS'),
-            LIBPATH=libpath + env['LIBPATH'],
-            CPPPATH=include + env['CPPPATH'],
-            CFLAGS=cflags+' $CFLAGS $LIBCFLAGS ',
-            CXXFLAGS=cflags+' $CXXFLAGS $LIBCFLAGS '
-            )
+if build_tinyusb:
+    env.Program('tinyusb', source,
+                LIBS=libs+env.get('LIBS'),
+                LIBPATH=libpath + env['LIBPATH'],
+                CPPPATH=include + env['CPPPATH'],
+                CFLAGS=cflags+' $CFLAGS $LIBCFLAGS ',
+                CXXFLAGS=cflags+' $CXXFLAGS $LIBCFLAGS '
+                )
