@@ -53,3 +53,4 @@ dkms.conf
 service/servicea
 service/serviceb
 service/vfsd
+driver/tinyusb/tinyusb

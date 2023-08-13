@@ -16,7 +16,7 @@ libs = [
 ]+env['LIBC']
 
 include = [
-    '../../eggs/libgaga',
+    '#/eggs/libgaga',
     'include',
     '.',
     'src',
@@ -85,7 +85,7 @@ if env['PLATFORM']=='raspi2':
     source += Glob('hw/bsp/broadcom_32bit/*.c')
     source += Glob('src/portable/raspberrypi/rp2/*.c')
 
-    cflags +=' -std=c99 -DCFG_TUSB_MCU=OPT_MCU_BCM2835 -DBCM_VERSION=2835 -D__ARM_ARCH -D__ARM_ARCH=6 '
+    cflags +=' -std=c99 -DCFG_TUSB_MCU=OPT_MCU_BCM2835 -DBCM_VERSION=2835 -D__ARM_ARCH -D__ARM_ARCH=6 -DCFG_TUD_LOG_LEVEL=0 '
     build_tinyusb=True
 else:
     print('todo support')

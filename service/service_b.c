@@ -2,12 +2,14 @@
 
 #include "client.h"
 
+int count=0;
+
 void* service_fn(void* fn, void* args) {
   printf("fn=>%d\n", fn);
 
   if (fn == 0) {
     printf("init %d %s\n", fn, args);
-    return 888;
+    return 888+count++;
   } else if (fn == 1) {
     printf("tick timer\n");
     return 2;

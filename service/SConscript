@@ -68,4 +68,13 @@ env.Program('vfsd', source,
     CXXFLAGS=cflags+' $CXXFLAGS $LIBCFLAGS '
             )
 
+source = ['systemd.c']
+
+env.Program('systemd', source,
+    LIBS=libs+env.get('LIBS'),
+    LIBPATH=libpath +env['LIBPATH'],
+    CPPPATH=include+ env['CPPPATH'] ,
+    CFLAGS=cflags+' $CFLAGS $LIBCFLAGS ',
+    CXXFLAGS=cflags+' $CXXFLAGS $LIBCFLAGS '
+            )
 
