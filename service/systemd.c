@@ -16,6 +16,9 @@ void* service_fn(void* fn, void* args) {
     case 2:
       ret = syscall(SYS_THREAD_MAP, arg[0], arg[1], arg[2], arg[3]);
       break;
+    case 3:
+    
+      break;
     default:
       break;
   }

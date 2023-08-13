@@ -68,9 +68,31 @@ static uint32_t blink_interval_ms = BLINK_NOT_MOUNTED;
 
 void led_blinking_task(void);
 
+void* service_fn(void* fn, void* args) {
+  int ret = 0;
+  char** arg = args;
+  switch ((int)fn) {
+    case 1:
+      led_blinking_task();
+      printf("led blinking task ok\n");
+      break;
+    case 2:
+      tud_init(BOARD_TUD_RHPORT);
+      tuh_init(BOARD_TUH_RHPORT);
+      printf("tud tuh init ok\n");
+      break;
+  }
+
+  return ret;
+}
+
 /*------------- MAIN -------------*/
 int main(void) {
   client_t* client = client_get("system");
+  if (client == NULL) {
+    perror("client get error\n");
+    exit(-1);
+  }
   char* args[] = {client->cid, 0x2000B880UL, 0x2000B880UL, 1024};
   int ret = client_call(client, 2, args);
   if (ret < 0) {
@@ -96,11 +118,13 @@ int main(void) {
   tud_init(BOARD_TUD_RHPORT);
   tuh_init(BOARD_TUH_RHPORT);
 
+  client_t* tinyusb = client_regist("tinyusb");
   int tick = 0;
   while (1) {
     tud_task();  // tinyusb device task
     tuh_task();  // tinyusb host task
     // led_blinking_task();
+    client_run_one(tinyusb, service_fn);
   }
 
   return 0;
