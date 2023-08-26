@@ -7,15 +7,12 @@
 import os
 import platform
 import copy
-from xenv.env import add_libc
 
 Import('appEnv')
 
 env=appEnv
 
 current = Dir('.').srcnode().path
-
-add_libc(env)
 
 returns=[]
 

@@ -34,7 +34,7 @@ source += [
     
 ]
 
-# env.Program('bluetooth', source,
+# env.Program('wifi', source,
 #             LIBS=libs+env.get('LIBS'),
 #             LIBPATH=libpath + env['LIBPATH'],
 #             CPPPATH=include + env['CPPPATH'],
