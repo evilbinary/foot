@@ -8,9 +8,9 @@ import os
 import platform
 import copy
 
-Import('appEnv')
+Import('cliEnv')
 
-env=appEnv
+env=cliEnv
 
 returns=[]
 
@@ -21,7 +21,5 @@ if env.get('APP'):
     SConscript(dirs=['bluetooth'], exports='env')
 else:
     pass
-
-Export('appEnv')
 
 Return('returns')

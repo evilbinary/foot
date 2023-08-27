@@ -8,9 +8,9 @@ import os
 import platform
 import copy
 
-Import('appEnv')
+Import('cliEnv')
 
-env=appEnv
+env=cliEnv
 
 current = Dir('.').srcnode().path
 
@@ -22,7 +22,5 @@ if env.get('APP'):
     SConscript(dirs=['service'], exports='env')
 else:
     pass
-
-Export('appEnv')
 
 Return('returns')

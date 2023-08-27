@@ -6,8 +6,9 @@
 # ********************************************************************
 import os
 
-Import('env')
-Import('cppEnv')
+Import('cliEnv')
+
+env=cliEnv
 
 cflags = '  '
 libs = [

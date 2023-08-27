@@ -88,11 +88,14 @@ void* service_fn(void* fn, void* args) {
 
 /*------------- MAIN -------------*/
 int main(void) {
+   printf("start tinyusb\n");
   client_t* client = client_get("system");
   if (client == NULL) {
     perror("client get error\n");
     exit(-1);
   }
+  printf("get system %s\n",client->name);
+  //0x3F200000UL GPIOBASE
   char* args[] = {client->cid, 0x2000B880UL, 0x2000B880UL, 1024};
   int ret = client_call(client, 2, args);
   if (ret < 0) {
