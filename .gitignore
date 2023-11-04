@@ -56,3 +56,7 @@ service/vfsd
 foot/driver/tinyusb
 service/systemd
 driver/tinyusb/tinyusb
+
+**/__pycache__
+
+**/**/__pycache__/**.pyc
