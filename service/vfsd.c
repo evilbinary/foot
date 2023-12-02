@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include "systemd.h"
 
 #include "client.h"
 
@@ -8,7 +9,7 @@ void* service_fn(void* fn, void* args) {
   if (fn == 0) {
     printf("init %d %s\n", fn, args);
     return 888;
-  } else if (fn == 1) {
+  } else if (fn == SYS_TIMER) {
     printf("tick timer\n");
     return 2;
   } else if (fn == 2) {

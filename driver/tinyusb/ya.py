@@ -82,7 +82,7 @@ if get_plat()=='raspi2':
     add_cflags(cflags)
 
 else:
-    print('todo support')
+    print('tinyusb todo support')
     pass
 
 
