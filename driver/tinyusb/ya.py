@@ -75,7 +75,7 @@ if get_plat()=='raspi2':
         'src/portable/raspberrypi/rp2/*.c'
     ]
 
-    cflags +=' -std=c99 -DCFG_TUSB_MCU=OPT_MCU_BCM2835 -DBCM_VERSION=2835 -D__ARM_ARCH -D__ARM_ARCH=6 -DCFG_TUD_LOG_LEVEL=0 '
+    cflags +=' -std=c99 -DCFG_TUSB_MCU=OPT_MCU_BCM2835 -DBCM_VERSION=2835 -D__ARM_ARCH -D__ARM_ARCH=6 -DCFG_TUD_LOG_LEVEL=0'
     
     add_files(source) 
     add_includedirs(include)

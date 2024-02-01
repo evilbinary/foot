@@ -31,7 +31,9 @@ int main(int argc, char* argv[]) {
   printf("get system is ==> %s\n",systemd->name);
   client_t* client = client_regist("serviceb");
 
-  client_call(systemd, SYS_INIT_TIMER, client->cid ,1);
+  printf("get client is ==> %d %d\n",client->cid,client->id);
+
+  client_call(systemd, SYS_INIT_TIMER, client->id ,1);
 
   client_run(client, service_fn);
 

@@ -96,7 +96,7 @@ int main(void) {
   }
   printf("get system %s\n",client->name);
   //0x3F200000UL GPIOBASE
-  char* args[] = {client->cid, 0x2000B880UL, 0x2000B880UL, 1024};
+  char* args[] = {client->cid, 0x2000B880UL, 0x2000B880UL, 1024,1};
   int ret = client_call(client, 2, args);
   if (ret < 0) {
     perror("map addr error\n");
@@ -104,7 +104,7 @@ int main(void) {
   }
   printf("map addr ret %d\n", ret);
 
-  char* args2[] = {client->cid, 0x20003000UL, 0x20003000UL, 1024};
+  char* args2[] = {client->cid, 0x20003000UL, 0x20003000UL, 1024,1};
   ret = client_call(client, 2, args2);
   if (ret < 0) {
     perror("map addr error\n");
@@ -128,6 +128,7 @@ int main(void) {
     tuh_task();  // tinyusb host task
     // led_blinking_task();
     client_run_one(tinyusb, service_fn);
+    sleep(1);
   }
 
   return 0;

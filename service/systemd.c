@@ -22,10 +22,10 @@ void* service_fn(void* fn, void* args) {
   char** arg = args;
   switch ((int)fn) {
     case SYS_MAP:
-      ret = syscall(SYS_THREAD_MAP, arg[0], arg[1], arg[2], arg[3]);
+      ret = syscall(SYS_THREAD_MAP, arg[0], arg[1], arg[2], arg[3], arg[4]);
       break;
     case SYS_INIT_TIMER: {  // register timer
-      printf("system timer init %x\n",arg[0]);
+      printf("system timer init %x\n", arg[0]);
 
       client_t* client = client_id(arg[0]);
       if (client != NULL) {
@@ -33,6 +33,9 @@ void* service_fn(void* fn, void* args) {
         t->client = client;
         t->freq = arg[1];
         timer_client[timer_client_size++] = t;
+        printf("system timer client init id %d \n", client->id);
+      } else {
+        printf("system timer client %d no found\n", arg[0]);
       }
     } break;
     default:
@@ -40,7 +43,7 @@ void* service_fn(void* fn, void* args) {
   }
   for (int i = 0; i < timer_client_size; i++) {
     system_timer_t* c = timer_client[i];
-    printf("system tick %s %d\n",c->client->name,c->ticks);
+    printf("system tick %s %d\n", c->client->name, c->ticks);
 
     if (c->freq % count == 0) {
       int ret = client_call(c->client, SYS_TIMER, c->ticks);
