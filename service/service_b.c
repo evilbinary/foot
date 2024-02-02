@@ -33,7 +33,8 @@ int main(int argc, char* argv[]) {
 
   printf("get client is ==> %d %d\n",client->cid,client->id);
 
-  client_call(systemd, SYS_INIT_TIMER, client->id ,1);
+  char* args[]={client->id ,1};
+  client_call(systemd, SYS_INIT_TIMER, args);
 
   client_run(client, service_fn);
 

@@ -1,22 +1,23 @@
 
 #include <stdio.h>
+
 #include "client.h"
+#include "configuration.h"
 #include "systemd.h"
 
 enum {
-  USB_INIT =0,
+  USB_INIT = 0,
   USB_TIMER = 1,
   USB_SVC = 2,
-  USB_CHECK=3,
+  USB_CHECK = 3,
 };
+int count = 0;
+client_t* system = NULL;
 
 void LogPrint(const char* message, unsigned int messageLength) {
   (void)messageLength;
-  printf("==>%s", message);
+  printf("%s", message);
 }
-
-
-int count = 0;
 
 void* service_fn(void* fn, void* args) {
   printf("fn=>%d\n", fn);
@@ -32,29 +33,19 @@ void* service_fn(void* fn, void* args) {
   } else if (fn == USB_SVC) {
     printf("svc call\n");
     return 2;
-  } else if(fn==USB_CHECK){
+  } else if (fn == USB_CHECK) {
     UsbCheckForChange();
   }
 }
 
-
-void usb_init(){
+void usb_init() {
   UsbInitialise();
+  UsbCheckForChange();
 }
 
-
-int main(int argc, char* argv[]) {
-  printf("start usbd\n");
-
-  client_t* system = client_get("system");
-  if (system == NULL) {
-    perror("client get error\n");
-    exit(-1);
-  }
-  printf("get system %s\n", system->name);
-
-  // 0x3F200000UL GPIOBASE
-  char* args[] = {system->cid, 0x2000B880UL, 0x2000B880UL, 1024, 1};
+void mmio_init() {
+  // MMIO_BASE GPIOBASE
+  char* args[] = {system->cid, MMIO_BASE, MMIO_BASE, 1024, 1};
   int ret = client_call(system, 2, args);
   if (ret < 0) {
     perror("map addr error\n");
@@ -62,25 +53,60 @@ int main(int argc, char* argv[]) {
   }
   printf("map addr ret %d\n", ret);
 
-  char* args2[] = {system->cid, 0x20003000UL, 0x20003000UL, 1024, 1};
+  char* args2[] = {system->cid, HCD_DESIGNWARE_BASE, HCD_DESIGNWARE_BASE, 1024,
+                   1};
   ret = client_call(system, 2, args2);
   if (ret < 0) {
     perror("map addr error\n");
     exit(-1);
   }
 
-  printf("map addr ret %d\n", ret);
+  // //Broadcom 2835 with a Designware OTG Core
+  char* args3[] = {system->cid, MMIO_BASE + 0x0000B000, MMIO_BASE + 0x0000B000,
+                   1024, 1};
+  ret = client_call(system, 2, args3);
+  if (ret < 0) {
+    perror("map addr error\n");
+    exit(-1);
+  }
+
+  char* args4[] = {system->cid, MMIO_BASE + 0x00003000, MMIO_BASE + 0x00003000,
+                   1024, 1};
+  ret = client_call(system, 2, args4);
+  if (ret < 0) {
+    perror("map addr error\n");
+    exit(-1);
+  }
+
+  char* args5[] = {system->cid, MMIO_BASE + 0x2e000, MMIO_BASE + 0x2e000, 1024,
+                   1};
+  ret = client_call(system, 2, args5);
+  if (ret < 0) {
+    perror("map addr error\n");
+    exit(-1);
+  }
+}
+
+int main(int argc, char* argv[]) {
+  printf("start usbd\n");
+
+  system = client_get("system");
+  if (system == NULL) {
+    perror("client get error\n");
+    exit(-1);
+  }
+  printf("get system %s\n", system->name);
 
   client_t* usb_client = client_regist("usb");
+  printf("get client cid=>%d id=>%d\n", usb_client->cid, usb_client->id);
 
-  printf("get client is ==> %d %d\n", usb_client->cid, usb_client->id);
 
-  client_call(system, SYS_INIT_TIMER, usb_client->id, 1);
-  
-  
+  mmio_init();
   usb_init();
 
-
+  char* args[] = {usb_client->id, 1};
+  client_call(system, SYS_INIT_TIMER, args);
+  
   client_run(usb_client, service_fn);
 
   return 0;

@@ -47,7 +47,7 @@ source += [
 
 if get_plat()=='raspi2':
 
-    cflags+='-DTARGET_RPI -DDEBUG -DTYPE_STANDALONE -DLIB_BCM2835 -DLIB_ARM_V6 -DLIB_HID -DLIB_KBD -DLIB_MOUSE '
+    cflags+='-DTARGET_RPI -DDEBUG -DTYPE_LOWLEVEL -DLIB_BCM2835 -DLIB_ARM_V6 -DLIB_HID -DLIB_KBD -DLIB_MOUSE '
 
     add_files(source) 
     add_includedirs(include)

@@ -18,7 +18,7 @@ extern "C"
 #endif
 
 #include <configuration.h>
-#include <types.h>
+#include <utypes.h>
 
 /**
 	\brief Allocates memory of specified length. 

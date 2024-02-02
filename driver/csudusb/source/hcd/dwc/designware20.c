@@ -642,8 +642,8 @@ Result HcdInitialise() {
 	LOG_DEBUG("HCD: Internal DMA mode.\n");
 	if (Core->Hardware.HighSpeedPhysical == NotSupported) {
 		LOG("HCD: High speed physical unsupported. Driver incompatible.\n");
-		result = ErrorIncompatible;
-		goto deallocate;
+		// result = ErrorIncompatible;
+		// goto deallocate;
 	}
 	LOG_DEBUGF("HCD: Hardware configuration: %08x %08x %08x %08x\n", *(u32*)&Core->Hardware, *((u32*)&Core->Hardware + 1), *((u32*)&Core->Hardware + 2), *((u32*)&Core->Hardware + 3));
 	ReadBackReg(&Host->Config);

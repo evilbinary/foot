@@ -17,6 +17,7 @@ extern "C"
 #endif
 
 #include <utypes.h>
+#include <wchar.h>
 
 /**
 	\brief The descriptor type field from the header of USB descriptors.
