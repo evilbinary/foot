@@ -6,5 +6,6 @@
 # ********************************************************************
 foot =get_config('foot')
 
-for f in foot:
-    add_subs('./'+f+'/ya.py')
+if foot:
+    for f in foot:
+        add_subs('./'+f+'/ya.py')
