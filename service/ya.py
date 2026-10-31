@@ -7,19 +7,19 @@
 target("servicea")
 set_type("cli")
 add_files("service_a.c") 
-add_deps("gaga")
+add_deps("foot")
 
 target("serviceb")
 set_type("cli")
 add_files("service_b.c") 
-add_deps("gaga")
+add_deps("foot")
 
 target("vfsd")
 set_type("cli")
 add_files("vfsd.c") 
-add_deps("gaga")
+add_deps("foot")
 
 target("systemd")
 set_type("cli")
 add_files("systemd.c") 
-add_deps("gaga")
+add_deps("foot")

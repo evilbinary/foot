@@ -7,12 +7,12 @@
 target("tinyusb")
 set_type("cli")
 
-add_deps("gaga")
+add_deps("foot")
 cflags = '  '
 
 source = []
 include = [
-    'eggs/libgaga',
+    'eggs/libfoot',
     'include',
     '.',
     'src',

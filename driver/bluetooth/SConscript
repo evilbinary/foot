@@ -12,12 +12,12 @@ env=cliEnv
 
 cflags = '  '
 libs = [
-    'gaga',
+    'foot',
 
 ]+env['LIBC']
 
 include = [
-    '../../eggs/libgaga',
+    '../../eggs/libfoot',
     'include',
     '.',
     'src',
@@ -26,7 +26,7 @@ include = [
 ]
 
 libpath = [
-    '#/eggs/libgaga/',
+    '#/eggs/libfoot/',
 ]
 
 source = []
