@@ -22,7 +22,12 @@ void* service_fn(void* fn, void* args) {
   char** arg = args;
   switch ((int)fn) {
     case SYS_MAP:
-      ret = syscall(SYS_THREAD_MAP, arg[0], arg[1], arg[2], arg[3], arg[4]);
+      /* 【阶段 4 已收权】内核 sys_thread_map 只接受"映射范围落在调用者
+       * 自己持有的 CAP_MMIO 窗口内"。中转映射（服务方替调用方填物理地址）
+       * 不再成立 —— 用户态驱动应自己用 foot_cap_get_mmio + foot_cap_map，
+       * 句柄按进程记账，服务方无法代持。这里保留分支只为报错更明确。 */
+      printf("systemd: SYS_MAP retired, use foot_cap_* (tid=%d)\n", arg[0]);
+      ret = -1;
       break;
     case SYS_INIT_TIMER: {  // register timer
       printf("system timer init %d %d\n", arg[0], arg[1]);

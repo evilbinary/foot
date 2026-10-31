@@ -48,46 +48,41 @@ void usb_init() {
   UsbCheckForChange();
 }
 
+/* 设备窗口能力句柄（bcm-periph：MMIO_BASE 起 16MB 的整段外设）。
+ * 阶段 4 之后内核不再接受用户态自己填物理地址的中转映射（sys_thread_map
+ * 需 CAP_MMIO 覆盖），所以映射改成"先换句柄、再用句柄映射"。 */
+static foot_cap_t mmio_cap = FOOT_CAP_NONE;
+
+static int mmio_map(unsigned long addr, unsigned long len) {
+  if (mmio_cap == FOOT_CAP_NONE) {
+    return -1;
+  }
+  unsigned long off = addr - (unsigned long)MMIO_BASE;
+  if (foot_cap_map(mmio_cap, (void*)addr, off, len) < 0) {
+    printf("mmio map %lx+%lx failed\n", addr, len);
+    return -1;
+  }
+  return 0;
+}
+
 void mmio_init() {
-  // MMIO_BASE GPIOBASE
-  char* args[] = {sys->cid, MMIO_BASE, MMIO_BASE, 1024, 1};
-  int ret = client_call(sys, 2, args);
-  if (ret < 0) {
-    perror("map addr error\n");
+  mmio_cap = foot_cap_get_mmio("bcm-periph");
+  if (mmio_cap == FOOT_CAP_NONE) {
+    printf("cap get mmio 'bcm-periph' failed\n");
     exit(-1);
   }
-  printf("map addr ret %d\n", ret);
+  printf("mmio cap=0x%x\n", mmio_cap);
 
-  char* args2[] = {sys->cid, HCD_DESIGNWARE_BASE, HCD_DESIGNWARE_BASE, 1024, 1};
-  ret = client_call(sys, 2, args2);
-  if (ret < 0) {
+  /* GPIO / DWC2 / SYS_TIMER 等寄存器窗口（映射长度按页对齐） */
+  if (mmio_map((unsigned long)MMIO_BASE, 0x1000) < 0 ||
+      mmio_map((unsigned long)HCD_DESIGNWARE_BASE, 0x10000) < 0 ||
+      mmio_map((unsigned long)MMIO_BASE + 0x0000B000, 0x1000) < 0 ||
+      mmio_map((unsigned long)MMIO_BASE + 0x00003000, 0x1000) < 0 ||
+      mmio_map((unsigned long)MMIO_BASE + 0x0002E000, 0x1000) < 0) {
     perror("map addr error\n");
     exit(-1);
   }
-
-  // //Broadcom 2835 with a Designware OTG Core
-  char* args3[] = {sys->cid, MMIO_BASE + 0x0000B000, MMIO_BASE + 0x0000B000,
-                   1024, 1};
-  ret = client_call(sys, 2, args3);
-  if (ret < 0) {
-    perror("map addr error\n");
-    exit(-1);
-  }
-
-  char* args4[] = {sys->cid, MMIO_BASE + 0x00003000, MMIO_BASE + 0x00003000,
-                   1024, 1};
-  ret = client_call(sys, 2, args4);
-  if (ret < 0) {
-    perror("map addr error\n");
-    exit(-1);
-  }
-
-  char* args5[] = {sys->cid, MMIO_BASE + 0x2e000, MMIO_BASE + 0x2e000, 1024, 1};
-  ret = client_call(sys, 2, args5);
-  if (ret < 0) {
-    perror("map addr error\n");
-    exit(-1);
-  }
+  printf("mmio map ok\n");
 }
 
 int main(int argc, char* argv[]) {
