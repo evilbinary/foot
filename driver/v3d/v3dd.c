@@ -16,7 +16,10 @@
  *
  * 跑法：/bin/v3dd（服务端常驻）。
  ********************************************************************/
+#include <fcntl.h>
 #include <stdio.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
 
 #include "client.h"
 #include "v3d_csd.h"
@@ -24,6 +27,24 @@
 #include "v3d_mmu.h"
 #include "v3d_regs.h"
 #include "v3d_tfu.h"
+
+/* /dev/fb 的 ioctl（与 duck/modules/vga + eggs/libgui/screen.h 一致） */
+#define FB_IOC_MAGIC 'v'
+#define IOC_READ_FRAMBUFFER _IOW(FB_IOC_MAGIC, 3, int)
+#define IOC_READ_FRAMBUFFER_WIDTH _IOW(FB_IOC_MAGIC, 4, int)
+#define IOC_READ_FRAMBUFFER_HEIGHT _IOW(FB_IOC_MAGIC, 5, int)
+#define IOC_READ_FRAMBUFFER_BPP _IOW(FB_IOC_MAGIC, 6, int)
+#define IOC_READ_FRAMBUFFER_INFO _IOW(FB_IOC_MAGIC, 8, int)
+#define IOC_READ_FRAMBUFFER_FORMAT _IOW(FB_IOC_MAGIC, 9, int)
+
+/* 显示格式常量（与内核 vga.h 的 VGA_FMT_* 对齐） */
+#define FB_FMT_UNKNOWN 0
+#define FB_FMT_RGB555 1
+#define FB_FMT_RGB565 2
+#define FB_FMT_BGR565 3
+#define FB_FMT_ARGB8888 4
+#define FB_FMT_RGB888 5
+#define FB_FMT_NV12 6
 
 /* 映射目标 VA：页对齐、远低于用户代码段（EXEC_ADDR），落在 MMIO 直通区。
  * 不 mmap：cap_map 直接写页表，VMA 不参与，避开了"匿名页被设备页覆盖"的
@@ -40,6 +61,9 @@
 #define DST_VA 0x46000000UL     /* TFU 目标 buffer CPU 映射 */
 #define SRC_GVA 0x10002000UL    /* TFU 源 GPU 虚拟地址 */
 #define DST_GVA 0x10010000UL    /* TFU 目标 GPU 虚拟地址 */
+#define FB_SRC_VA 0x47000000UL  /* 屏幕填充：RGB565 源行 CPU 映射 */
+#define FB_SRC_GVA 0x10020000UL /* 屏幕填充：RGB565 源行 GPU 虚拟地址 */
+#define FB_GVA 0x20000000UL     /* 屏幕 framebuffer 的 GPU 虚拟地址 */
 
 static volatile uint32_t* g_v3d_va;
 static v3d_dev_t g_dev;
@@ -254,6 +278,106 @@ int main(int argc, char* argv[]) {
           trc, v3d_tfu_status(&g_dev), dst[0], dst[W * H - 1]);
     } else {
       printf("v3dd: TFU selftest skipped (alloc/map failed)\n");
+    }
+  }
+
+  /* 7d) 屏幕填充：TFU 直接写 /dev/fb 的 framebuffer（格式按驱动申报动态选） */
+  {
+    int ffd = open("/dev/fb", O_RDWR);
+    if (ffd >= 0) {
+      uint32_t fb_pa = (uint32_t)ioctl(ffd, IOC_READ_FRAMBUFFER, 0);
+      uint32_t fw = (uint32_t)ioctl(ffd, IOC_READ_FRAMBUFFER_WIDTH, 0);
+      uint32_t fh = (uint32_t)ioctl(ffd, IOC_READ_FRAMBUFFER_HEIGHT, 0);
+      uint32_t fbpp = (uint32_t)ioctl(ffd, IOC_READ_FRAMBUFFER_BPP, 0);
+      uint32_t ffmt = (uint32_t)ioctl(ffd, IOC_READ_FRAMBUFFER_FORMAT, 0);
+      close(ffd);
+
+      /* VGA_FMT_* → (V3D Texture Data Format, 每像素字节数)。
+       * fmt==0（驱动未申报）时按 bpp 推断。 */
+      uint32_t tex = 0, cpp = 0;
+      int fmt_ok = 0;
+      switch (ffmt) {
+        case FB_FMT_RGB555:
+          tex = 8; /* Texture Data Format RGB5_A1 */
+          cpp = 2;
+          fmt_ok = 1;
+          break;
+        case FB_FMT_RGB565:
+        case FB_FMT_BGR565: /* 字节序差异，纯色填充可接受 */
+          tex = V3D_TEX_FORMAT_RGB565;
+          cpp = 2;
+          fmt_ok = 1;
+          break;
+        case FB_FMT_ARGB8888:
+          tex = 4; /* Texture Data Format RGBA8 */
+          cpp = 4;
+          fmt_ok = 1;
+          break;
+        default:
+          break;
+      }
+      if (!fmt_ok && ffmt == FB_FMT_UNKNOWN) {
+        if (fbpp == 16) {
+          tex = V3D_TEX_FORMAT_RGB565;
+          cpp = 2;
+          fmt_ok = 1;
+        } else if (fbpp == 32) {
+          tex = 4;
+          cpp = 4;
+          fmt_ok = 1;
+        }
+      }
+
+      printf("v3dd: /dev/fb pa=0x%08x %ux%u bpp=%u fmt=%u -> tex=%u cpp=%u\n",
+             fb_pa, fw, fh, fbpp, ffmt, tex, cpp);
+
+      if (fb_pa != 0 && fw > 0 && fh > 0 && fmt_ok) {
+        uint32_t line_bytes = fw * cpp;
+        uint32_t src_bytes =
+            (line_bytes + V3D_MMU_PAGE_SIZE - 1) & ~(V3D_MMU_PAGE_SIZE - 1);
+        uint32_t src_pages = src_bytes / V3D_MMU_PAGE_SIZE;
+        uint32_t src_pa = 0, src_size = 0;
+        foot_cap_t sc =
+            foot_cap_alloc_arena(src_bytes, 0, 0, &src_pa, &src_size);
+        if (sc != FOOT_CAP_NONE &&
+            foot_cap_map(sc, (void*)FB_SRC_VA, 0, src_size) == 0) {
+          volatile uint32_t* s32 = (volatile uint32_t*)FB_SRC_VA;
+          /* 一行纯色：RGB565 红 = 0xF800×2；ARGB8888 红 = 0xFFFF0000 */
+          uint32_t pat32 = (cpp == 4) ? 0xFFFF0000u : 0xF800F800u;
+          uint32_t nw = line_bytes / 4;
+          for (uint32_t i = 0; i < nw; i++) {
+            s32[i] = pat32;
+          }
+          foot_cache_clean((void*)s32, (void*)(FB_SRC_VA + src_bytes));
+
+          volatile uint32_t* pt = (volatile uint32_t*)PT_VA;
+          for (uint32_t i = 0; i < src_pages; i++) {
+            v3d_mmu_map_page(pt, FB_SRC_GVA + i * V3D_MMU_PAGE_SIZE,
+                             src_pa + i * V3D_MMU_PAGE_SIZE);
+          }
+          /* framebuffer 物理页逐页映射到 GPU VA（假定 pitch = width*cpp） */
+          uint32_t fb_bytes = fw * fh * cpp;
+          uint32_t pages =
+              (fb_bytes + V3D_MMU_PAGE_SIZE - 1) / V3D_MMU_PAGE_SIZE;
+          for (uint32_t i = 0; i < pages; i++) {
+            v3d_mmu_map_page(pt, FB_GVA + i * V3D_MMU_PAGE_SIZE,
+                             fb_pa + i * V3D_MMU_PAGE_SIZE);
+          }
+          foot_cache_clean((void*)pt, (void*)(PT_VA + V3D_MMU_PT_BYTES));
+          v3d_mmu_flush(&g_dev);
+
+          int frc =
+              v3d_tfu_fill_ex(&g_dev, FB_SRC_GVA, FB_GVA, fw, fh, fw, tex);
+          printf("v3dd: FB fill rc=%d status=0x%08x (screen filled)\n", frc,
+                 v3d_tfu_status(&g_dev));
+        } else {
+          printf("v3dd: FB src alloc/map failed\n");
+        }
+      } else if (!fmt_ok) {
+        printf("v3dd: fb format unsupported (fmt=%u bpp=%u)\n", ffmt, fbpp);
+      }
+    } else {
+      printf("v3dd: /dev/fb open failed\n");
     }
   }
 

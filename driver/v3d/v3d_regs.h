@@ -129,8 +129,9 @@
 #define V3D_TFU_ICFG_FORMAT_RASTER 0u
 #define V3D_TFU_ICFG_FORMAT_LINEARTILE 3u
 #define V3D_TFU_ICFG_OTYPE_SHIFT 16
-/* Texture Data Format RGBA8UI（v3d_packet.xml: 101） */
-#define V3D_TEX_FORMAT_RGBA8UI 101u
+/* Texture Data Format（v3d_packet.xml） */
+#define V3D_TEX_FORMAT_RGBA8UI 101u /* 32bpp RGBA */
+#define V3D_TEX_FORMAT_RGB565 6u    /* 16bpp（B in low bits） */
 
 /* HUB 中断状态/清除位 */
 #define V3D_HUB_INT_TFUC (1u << 1) /* TFU 转换完成 */
