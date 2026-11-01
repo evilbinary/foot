@@ -23,6 +23,7 @@
 #include "v3d_hw.h"
 #include "v3d_mmu.h"
 #include "v3d_regs.h"
+#include "v3d_tfu.h"
 
 /* 映射目标 VA：页对齐、远低于用户代码段（EXEC_ADDR），落在 MMIO 直通区。
  * 不 mmap：cap_map 直接写页表，VMA 不参与，避开了"匿名页被设备页覆盖"的
@@ -35,6 +36,10 @@
 #define UNI_VA 0x44100000UL     /* uniform 页 CPU 映射 */
 #define SHADER_GVA 0x10000000UL /* shader 的 GPU 虚拟地址 */
 #define UNIFORM_GVA 0x10001000UL /* uniform 的 GPU 虚拟地址 */
+#define SRC_VA 0x45000000UL     /* TFU 源 buffer CPU 映射 */
+#define DST_VA 0x46000000UL     /* TFU 目标 buffer CPU 映射 */
+#define SRC_GVA 0x10002000UL    /* TFU 源 GPU 虚拟地址 */
+#define DST_GVA 0x10010000UL    /* TFU 目标 GPU 虚拟地址 */
 
 static volatile uint32_t* g_v3d_va;
 static v3d_dev_t g_dev;
@@ -202,6 +207,53 @@ int main(int argc, char* argv[]) {
       } else {
         printf("v3dd: CSD selftest skipped (alloc/map failed)\n");
       }
+    }
+  }
+
+  /* 7c) P3：TFU fill 自检（stride-0 广播，纯硬件填充，不需要 shader） */
+  {
+    volatile uint32_t* pt = (volatile uint32_t*)PT_VA;
+    const uint32_t W = 64, H = 64, cpp = 4;
+    const uint32_t dst_bytes = W * H * cpp; /* 16KB */
+    const uint32_t dst_pages = dst_bytes / V3D_MMU_PAGE_SIZE;
+
+    uint32_t src_pa = 0, src_size = 0, dst_pa = 0, dst_size = 0;
+    foot_cap_t sc =
+        foot_cap_alloc_arena(V3D_MMU_PAGE_SIZE, 0, 0, &src_pa, &src_size);
+    foot_cap_t dc = foot_cap_alloc_arena(dst_bytes, 0, 0, &dst_pa, &dst_size);
+    if (sc != FOOT_CAP_NONE && dc != FOOT_CAP_NONE &&
+        foot_cap_map(sc, (void*)SRC_VA, 0, src_size) == 0 &&
+        foot_cap_map(dc, (void*)DST_VA, 0, dst_size) == 0) {
+      volatile uint32_t* src = (volatile uint32_t*)SRC_VA;
+      volatile uint32_t* dst = (volatile uint32_t*)DST_VA;
+
+      /* 源：一行 64 个像素；目标清 0 便于对比 */
+      for (uint32_t i = 0; i < W; i++) {
+        src[i] = 0x11223344u;
+      }
+      for (uint32_t i = 0; i < W * H; i++) {
+        dst[i] = 0;
+      }
+      foot_cache_clean((void*)src, (void*)(SRC_VA + V3D_MMU_PAGE_SIZE));
+      foot_cache_clean((void*)dst, (void*)(DST_VA + dst_bytes));
+
+      /* 映射到 GPU 地址空间（src 一页，dst 多页） */
+      v3d_mmu_map_page(pt, SRC_GVA, src_pa);
+      for (uint32_t i = 0; i < dst_pages; i++) {
+        v3d_mmu_map_page(pt, DST_GVA + i * V3D_MMU_PAGE_SIZE,
+                         dst_pa + i * V3D_MMU_PAGE_SIZE);
+      }
+      foot_cache_clean((void*)pt, (void*)(PT_VA + V3D_MMU_PT_BYTES));
+      v3d_mmu_flush(&g_dev);
+
+      int trc = v3d_tfu_fill(&g_dev, SRC_GVA, DST_GVA, W, H);
+      /* TFU 是 DMA 写内存，CPU 侧要 invalidate 才能看到新值 */
+      foot_cache_invalidate((void*)dst, (void*)(DST_VA + dst_bytes));
+      printf(
+          "v3dd: TFU fill rc=%d status=0x%08x dst[0]=0x%08x dst[last]=0x%08x\n",
+          trc, v3d_tfu_status(&g_dev), dst[0], dst[W * H - 1]);
+    } else {
+      printf("v3dd: TFU selftest skipped (alloc/map failed)\n");
     }
   }
 

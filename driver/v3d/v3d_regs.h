@@ -91,6 +91,51 @@
 #define V3D_PTE_VALID (1u << 28)
 #define V3D_PTE_PFN_MASK 0x0FFFFFFFu
 
+/* ---- TFU（Texture Formatting Unit，hub 窗口 0x700 起；V3D 7.x）----
+ * 用途：图像/内存格式转换与拷贝。V3D 7.1 支持 stride-0 源（把第一行
+ * 广播到所有输出行）⇒ 可做纯色/图案填充，不需要 shader、不需要命令流。
+ * 提交流程对照 Linux drm/v3d/v3d_sched.c: v3d_tfu_job_run()：
+ *   写 IIA/IIS/ICA/IUA/IOA/IOC/IOS/COEF* → 最后写 ICFG（带 IOC 位）触发。 */
+#define V3D_TFU_CS 0x00700u /* 控制/状态 */
+#define V3D_TFU_CS_BUSY (1u << 0)
+#define V3D_TFU_CS_NFREE_SHIFT 8
+#define V3D_TFU_CS_NFREE_MASK 0x3F00u
+#define V3D_TFU_CS_CVTCT_SHIFT 16
+#define V3D_TFU_CS_CVTCT_MASK 0xFF0000u
+#define V3D_TFU_CS_TFURST (1u << 31)
+
+#define V3D_TFU_SU 0x00704u
+#define V3D_TFU_ICFG 0x00708u /* 输入配置；写下去即触发 job */
+#define V3D_TFU_ICFG_IOC (1u << 0) /* 完成时产生中断 */
+#define V3D_TFU_IIA 0x0070cu   /* 输入图像地址（GPU VA） */
+#define V3D_TFU_ICA 0x00710u   /* 输入 chroma 地址 */
+#define V3D_TFU_IIS 0x00714u   /* 输入图像 stride（stride/cpp；0 = 广播） */
+#define V3D_TFU_IUA 0x00718u   /* 输入 U-plane 地址 */
+#define V3D_V7_TFU_IOC 0x0071cu /* 输出图像配置（V3D 7.x 专用） */
+#define V3D_V7_TFU_IOC_FORMAT_SHIFT 12
+#define V3D_V7_TFU_IOC_FORMAT_RASTER 0u
+#define V3D_V7_TFU_IOC_FORMAT_LINEARTILE 3u
+#define V3D_V7_TFU_IOC_STRIDE_SHIFT 16
+#define V3D_V7_TFU_IOC_NUMMM_SHIFT 4
+#define V3D_V7_TFU_IOC_DIMTW (1u << 0)
+#define V3D_TFU_IOA 0x00720u /* 输出图像地址（GPU VA） */
+#define V3D_TFU_IOS 0x00724u /* 输出尺寸：(height << 16) | width */
+#define V3D_TFU_COEF0 0x00728u
+#define V3D_TFU_COEF1 0x0072cu
+#define V3D_TFU_COEF2 0x00730u
+#define V3D_TFU_COEF3 0x00734u
+
+#define V3D_TFU_ICFG_IFORMAT_SHIFT 23
+#define V3D_TFU_ICFG_FORMAT_RASTER 0u
+#define V3D_TFU_ICFG_FORMAT_LINEARTILE 3u
+#define V3D_TFU_ICFG_OTYPE_SHIFT 16
+/* Texture Data Format RGBA8UI（v3d_packet.xml: 101） */
+#define V3D_TEX_FORMAT_RGBA8UI 101u
+
+/* HUB 中断状态/清除位 */
+#define V3D_HUB_INT_TFUC (1u << 1) /* TFU 转换完成 */
+#define V3D_HUB_INT_TFUF (1u << 0) /* TFU fifo */
+
 /* ---- core0 寄存器 ---- */
 #define V3D_CTL_IDENT0 0x00000u
 #define V3D_CTL_IDENT1 0x00004u /* NSEM/NTMU/QUPS/NSLC/REV */
