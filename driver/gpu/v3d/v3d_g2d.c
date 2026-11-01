@@ -30,7 +30,7 @@
 /* g2d 内核/逻辑的版本号 —— 每次改动 two_d.h 里的内核或本文件的调度逻辑就加一。
  * 启动那行会打印出来，用来确认板子上跑的是不是最新版（gpud.c 里的
  * __DATE__/__TIME__ 不可靠，因为那个文件不重编）。 */
-#define G2D_REV 74
+#define G2D_REV 76
 
 #define G2D_GVA_BASE 0x11000000UL
 #define G2D_UNIFORM_GVA (G2D_GVA_BASE + 8192UL)

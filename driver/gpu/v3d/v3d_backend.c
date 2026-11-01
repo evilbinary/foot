@@ -30,6 +30,9 @@
 #include "v3d_regs.h"
 #include "v3d_tfu.h"
 
+#include <signal.h>
+#include <unistd.h>
+
 /* /dev/fb 的 ioctl（与 duck/modules/vga + eggs/libgui/screen.h 一致） */
 #define FB_IOC_MAGIC 'v'
 #define IOC_READ_FRAMBUFFER _IOW(FB_IOC_MAGIC, 3, int)
@@ -244,6 +247,62 @@ static int screen_fill(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
 
 /* ================== gpu_backend_t 实现 ================== */
 
+/* 【优雅关闭】把 V3D 硬件置回复位态。
+ *
+ * 为什么需要：gpud 被 kill -9 时用户态什么都没做，硬件停在运行态。
+ * 下一次启动就会看到
+ *     v3d: sms rc=0 pm rc=0 ree_cs=0x80000000   （正常应为 0x00000000）
+ * 这种脏状态下 g2d 服务虽然能注册，但客户端拿到的 client 是无效的，
+ * 表现为 client_get 之后崩在 libfoot 里（FAR=0x20）。
+ *
+ * 这里做两件事：
+ *   1. 清 PM 的 V3DRSTN —— 把 QPU 阵列拉回复位；
+ *   2. 写 SMS 让它回到 IDLE 状态。
+ * 都由 MMIO 完成，可以在信号处理函数里安全执行。 */
+static void v3d_hw_shutdown(void) {
+  /* v3d_dev_t 只有 hub/core0/sms/pm 四个指针，用 pm 判空作为
+   * "已初始化"的判据（初始化时最先建立的就是这几个映射）。 */
+  if (g_dev.pm == NULL && g_dev.sms == NULL) {
+    return;
+  }
+  /* 1) PM: 清 V3DRSTN（注意高 16 位是 password） */
+  if (g_dev.pm != NULL) {
+    uint32_t v = g_dev.pm[V3D_PM_GRAFX_OFF / 4];
+    v &= ~V3D_PM_V3DRSTN;
+    g_dev.pm[V3D_PM_GRAFX_OFF / 4] = (V3D_PM_PASSWORD) | (v & 0xFFFFu);
+    __asm__ volatile("dsb sy" ::: "memory");
+  }
+  /* 2) SMS: 等状态回 IDLE（不完全依赖，只是尽力而为） */
+  if (g_dev.sms != NULL) {
+    for (int i = 0; i < 50; i++) {
+      uint32_t st = g_dev.sms[V3D_SMS_REE_CS / 4] & V3D_SMS_STATE_MASK;
+      if (st == V3D_SMS_STATE_IDLE) {
+        break;
+      }
+      usleep(1000);
+    }
+  }
+  __asm__ volatile("dsb sy" ::: "memory");
+}
+
+/* 信号处理：先复位硬件再退出。只调用 async-signal-safe 的操作
+ * （MMIO 写 + usleep + _exit）。 */
+static void v3d_signal_handler(int sig) {
+  v3d_hw_shutdown();
+  _exit(sig == SIGTERM || sig == SIGINT ? 0 : 1);
+}
+
+static void v3d_install_signal_handlers(void) {
+  struct sigaction sa;
+  sa.sa_handler = v3d_signal_handler;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = 0;
+  sigaction(SIGTERM, &sa, NULL);
+  sigaction(SIGINT, &sa, NULL);
+  sigaction(SIGHUP, &sa, NULL);
+  /* 注意：不接 SIGKILL（无法捕获），也不接 SIGSEGV（会让调试信息消失） */
+}
+
 static int v3d_init(void) {
   /* 1) 映射 V3D 寄存器窗口（hub + core0 + SMS，0x40000） */
   foot_cap_t cap = foot_cap_get_mmio("v3d");
@@ -309,14 +368,40 @@ static int v3d_init(void) {
    * CSD_STATUS 有值、INT_STS 只有残留位、像素全 0，看起来像"跑了但没写"。
    * 这两行原来没检查返回值，失败是静默的，这里必须回读状态寄存器。 */
   {
-    int rc_sms = v3d_sms_powerup(&g_dev);
-    int rc_pm = v3d_pm_reset(&g_dev);
-    uint32_t ree = g_dev.sms[V3D_SMS_REE_CS / 4];
-    uint32_t pmg = g_dev.pm[V3D_PM_GRAFX_OFF / 4];
-    printf("v3d: sms rc=%d pm rc=%d ree_cs=0x%08x(state=0x%x) "
-           "pm_grafx=0x%08x rstn=%u\n",
-           rc_sms, rc_pm, ree, (unsigned)(ree & V3D_SMS_STATE_MASK), pmg,
-           (pmg & V3D_PM_V3DRSTN) ? 1u : 0u);
+    /* 【先判断硬件是不是已经在跑，避免重复初始化】
+     *
+     * "已经在跑" 的三个条件同时成立才算：
+     *   1. PM.V3DRSTN = 1        —— QPU 阵列已解锁
+     *   2. SMS state = IDLE(0)   —— 电源状态机空闲
+     *   3. REE_CS 的 bit31 = 0   —— 没有残留的异常标志
+     *
+     * 第 3 条很关键：上一个 gpud 被 kill -9 后会留下 ree_cs=0x80000000，
+     * 这种脏状态下服务虽然能注册，但客户端拿到的 client 无效。
+     * 遇到脏状态必须重新走一遍完整初始化，而不是跳过。
+     *
+     * 注意：MMU 页表 / L2C / 片内缓存是【每个实例自己的】，
+     * 不管硬件是否已上电都要重新建立，所以只跳过 SMS+PM 这两步。 */
+    uint32_t ree0 = g_dev.sms[V3D_SMS_REE_CS / 4];
+    uint32_t pmg0 = g_dev.pm[V3D_PM_GRAFX_OFF / 4];
+    uint32_t st0 = ree0 & V3D_SMS_STATE_MASK;
+    int rstn0 = (pmg0 & V3D_PM_V3DRSTN) ? 1 : 0;
+    int dirty = (ree0 & 0x80000000u) ? 1 : 0;
+
+    if (rstn0 && st0 == V3D_SMS_STATE_IDLE && !dirty) {
+      printf("v3d: hw already on (ree_cs=0x%08x pm_grafx=0x%08x) "
+             "-> skip powerup/reset\n",
+             ree0, pmg0);
+    } else {
+      int rc_sms = v3d_sms_powerup(&g_dev);
+      int rc_pm = v3d_pm_reset(&g_dev);
+      uint32_t ree = g_dev.sms[V3D_SMS_REE_CS / 4];
+      uint32_t pmg = g_dev.pm[V3D_PM_GRAFX_OFF / 4];
+      printf("v3d: sms rc=%d pm rc=%d ree_cs=0x%08x(state=0x%x) "
+             "pm_grafx=0x%08x rstn=%u%s\n",
+             rc_sms, rc_pm, ree, (unsigned)(ree & V3D_SMS_STATE_MASK), pmg,
+             (pmg & V3D_PM_V3DRSTN) ? 1u : 0u,
+             dirty ? " [was dirty]" : "");
+    }
   }
 
   /* 6) P1：解析 IDENT1/IDENT3 */
@@ -387,6 +472,11 @@ static int v3d_init(void) {
   screen_init();
 
   printf("v3d: backend ready (ver=%u ncores=%u)\n", ver, ncores);
+
+  /* 从现在起接管 SIGTERM/SIGINT，退出时复位 V3D 硬件。
+   * 没有这一步的话，被 kill 后硬件停在运行态，下次启动
+   * 会看到 ree_cs=0x80000000 的脏状态。 */
+  v3d_install_signal_handlers();
 
   /* ---- CSD 2D 自测（离屏 ARGB8888，不碰屏幕）----
    * 目的：验证 QPU 2D 内核能跑、uniform 传参正确。屏幕是 16bpp，
