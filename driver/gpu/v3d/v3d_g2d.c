@@ -30,7 +30,7 @@
 /* g2d 内核/逻辑的版本号 —— 每次改动 two_d.h 里的内核或本文件的调度逻辑就加一。
  * 启动那行会打印出来，用来确认板子上跑的是不是最新版（gpud.c 里的
  * __DATE__/__TIME__ 不可靠，因为那个文件不重编）。 */
-#define G2D_REV 76
+#define G2D_REV 89
 
 #define G2D_GVA_BASE 0x11000000UL
 #define G2D_UNIFORM_GVA (G2D_GVA_BASE + 8192UL)
@@ -58,7 +58,7 @@
 #define G2D_TEXSTATE_OFF 8128u  /* 8128 = 127*64 */
 #define G2D_SAMPSTATE_OFF 8144u /* 8128 + 16 */
 #define G2D_UNIFORM_BYTES 4096u /* 1 页：只用前 64B */
-#define G2D_SCRATCH_BYTES 16384u /* 4 页 */
+#define G2D_SCRATCH_BYTES 65536u /* 16 页：要放 present 的 RGB565 中转图 */
 #define G2D_TOTAL_BYTES \
   (G2D_KERNEL_BYTES + G2D_UNIFORM_BYTES + G2D_SCRATCH_BYTES)
 
@@ -91,6 +91,10 @@ static struct {
   uint32_t mini_gva;
   uint32_t minic_gva;
   uint32_t minic2_gva;
+  /* 【present 中转区】GPU 先把转换结果写成连续的 RGB565 放在这里，
+   * 再由 TFU 带 stride 贴上屏 —— 因为屏幕 pitch 和内容宽度不同，
+   * 内核的线性扫描没法直接写屏幕，逐行 dispatch 会累计超时。
+   * gva 复用已有的 scratch_gva。 */
   uint32_t texstate_gva;
   uint32_t texstate_va;
   uint32_t sampstate_gva;
@@ -596,8 +600,9 @@ int v3d_g2d_blit_gpu(v3d_dev_t* v, uint32_t src_gva, uint32_t dst_gva,
   if (!g_g2d.inited || src_gva == 0 || dst_gva == 0 || w == 0 || h == 0) {
     return -1;
   }
-  uint32_t chunks = (w * h) / 16u;
-  if (chunks == 0 || (w * h) % 16u != 0) {
+  /* 转换内核每 lane 处理 2 个源像素：一轮 16 lane × 2 = 32 像素 */
+  uint32_t chunks = (w * h) / 32u;
+  if (chunks == 0 || (w * h) % 32u != 0) {
     return -2;
   }
 
@@ -623,7 +628,7 @@ int v3d_g2d_blit_gpu(v3d_dev_t* v, uint32_t src_gva, uint32_t dst_gva,
    * 所以 BO 多分配了 8KB（见 self-test 里的 alloc 调用）。 */
   uint32_t nq = g_g2d.num_qpus ? g_g2d.num_qpus : 1u;
   uint32_t rounds = (chunks + nq - 1u) / nq;
-  uint32_t qpu_stride = rounds * 64u;
+  uint32_t qpu_stride = rounds * 128u; /* 每轮源推进 128 字节 */
 
   uint32_t u[5];
   u[0] = src_gva;
@@ -744,27 +749,48 @@ int v3d_g2d_miniread(v3d_dev_t* v, uint32_t src_gva, uint32_t dst_gva,
  * 所以一次 dispatch 处理 16 lane × 2 = 32 像素。
  *
  * 要求 (w*h) % 32 == 0；否则由调用方把宽度补齐（见 v3d_present）。 */
-int v3d_g2d_present_gpu(v3d_dev_t* v, uint32_t src_gva, uint32_t dst_gva,
-                        uint32_t w, uint32_t h) {
-  if (!g_g2d.inited || src_gva == 0 || dst_gva == 0 || w == 0 || h == 0) {
+int v3d_g2d_present_gpu(v3d_dev_t* v, uint32_t src_gva, uint32_t w,
+                        uint32_t h, uint32_t* out_scratch_gva) {
+  /* 职责：把 ARGB8888 转成【紧凑连续】的 RGB565，写进 scratch 区。
+   * 上屏交给调用方用 TFU 完成 —— 因为屏幕 pitch 和内容宽度不同，
+   * 而 TFU 原生支持不同的源/目的 stride。
+   *
+   * out_scratch_gva 回传中转区地址，调用方拿它做 TFU 源。 */
+  if (!g_g2d.inited || src_gva == 0 || w == 0 || h == 0) {
     return -1;
   }
-  uint32_t rounds = (w * h) / 32u;
-  if (rounds == 0 || (w * h) % 32u != 0) {
-    return -2; /* 目前要求像素数是 32 的倍数 */
+  uint32_t chunks = (w * h) / 16u;
+  if (chunks == 0 || (w * h) % 16u != 0) {
+    return -2;
+  }
+  uint32_t scratch_gva = g_g2d.scratch_gva;
+  if (scratch_gva == 0 || (w * h * 2u) > G2D_SCRATCH_BYTES) {
+    return -3; /* 中转区放不下 */
   }
 
-  /* u0=src u1=dst u2=轮数 u3=源步长(128) u4=目的步长(64)
-   * u5..u7 = RGB565 掩码 */
-  uint32_t u[8];
+  /* Texture State 指向 src（TMU 读的上下文，缺了会卡死） */
+  {
+    volatile uint32_t* ts = (volatile uint32_t*)(uintptr_t)g_g2d.texstate_va;
+    uint32_t stride_bytes = w * 4u;
+    ts[0] = src_gva;
+    ts[1] = (stride_bytes / 64u) | ((w & 0x3Fu) << 26);
+    ts[2] = ((w >> 6) & 0xFFu) | (h << 8) | (1u << 22);
+    ts[3] = (4u << 4) | (2u << 12) | (3u << 15) | (4u << 18) | (5u << 21);
+    foot_cache_clean((void*)(uintptr_t)g_g2d.texstate_va,
+                     (void*)(uintptr_t)(g_g2d.sampstate_va + 24));
+  }
+
+  uint32_t nq = g_g2d.num_qpus ? g_g2d.num_qpus : 1u;
+  uint32_t rounds = (chunks + nq - 1u) / nq;
+  uint32_t qpu_stride = rounds * 64u;
+
+  uint32_t u[6];
   u[0] = src_gva;
-  u[1] = dst_gva;
+  u[1] = scratch_gva;
   u[2] = rounds;
-  u[3] = 128u;   /* 16 lane × 8 字节 */
-  u[4] = 64u;    /* 16 lane × 4 字节 */
-  u[5] = 0xF800u;
-  u[6] = 0x07E0u;
-  u[7] = 0x001Fu;
+  u[3] = 128u; /* 源步长：16 lane × 8 字节 */
+  u[4] = 64u;  /* 目的步长：16 lane × 4 字节 */
+  u[5] = qpu_stride;
 
   {
     volatile uint32_t* up = (volatile uint32_t*)(uintptr_t)g_g2d.uniform_va;
@@ -774,12 +800,14 @@ int v3d_g2d_present_gpu(v3d_dev_t* v, uint32_t src_gva, uint32_t dst_gva,
   }
   memcpy((void*)(uintptr_t)g_g2d.uniform_va, u, sizeof(u));
 
-  /* 【只启动 1 个 QPU】present 内核没有 tidx 分段（不像 copy_vec 那样用
-   * tidx>>2 各自认领一段），它是一条线性扫全图的程序。启动 12 个 QPU 时
-   * 12 个实例会同时从 src 开头处理、互相覆盖，还会抢同一个 TMU 请求队列
-   * —— 实测表现为服务调用超时（client 侧 "foot wait: timeout"），
-   * 因为 GPU 那边的 CSD 迟迟不退役。
-   * 这里固定 nq=1。若以后要提速，应当像 copy_vec 那样先加 tidx 分段。 */
-  return g2d_dispatch(v, K_PRESENTV, 1, 1, 1);
+  v->hub[V3D_MMU_VIO_ID / 4] = 0;
+  v->hub[V3D_MMU_VIO_ADDR / 4] = 0;
+  __asm__ volatile("dmb sy" ::: "memory");
+
+  int rc = g2d_dispatch(v, K_PRESENTV, nq, 1, 1);
+  if (rc == 0 && out_scratch_gva != NULL) {
+    *out_scratch_gva = scratch_gva;
+  }
+  return rc;
 }
 

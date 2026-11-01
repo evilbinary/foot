@@ -1067,30 +1067,27 @@ static int v3d_present(void* args) {
 
   uint32_t w32 = (r->w + 31u) & ~31u;
   if (w32 != r->w) {
-    return -3; /* 宽度不是 32 的倍数：补齐会越界读源 */
+    return -3; /* 宽度须为 32 的倍数 */
   }
 
-  uint32_t src_stride = r->w * 4u;      /* 源按紧凑 ARGB8888 */
-  uint32_t dst_stride = g_screen.pitch; /* 屏幕已是字节 stride */
-  if (dst_stride < w32 * 2u) {
-    return -3;
-  }
-
+  uint32_t src_stride = r->w * 4u; /* 源按紧凑 ARGB8888 */
   uint32_t sb = g_bos[i].gva + r->sy * src_stride + r->sx * 4u;
-  uint32_t db = FB_GVA + r->dy * dst_stride + r->dx * 2u;
 
-  if (src_stride == w32 * 4u && dst_stride == w32 * 2u) {
-    return v3d_g2d_present_gpu(&g_dev, sb, db, w32, r->h);
+  /* 第 1 步：GPU 转成紧凑 RGB565，落在 g2d 的 scratch 区 */
+  uint32_t scratch_gva = 0;
+  int rc = v3d_g2d_present_gpu(&g_dev, sb, r->w, r->h, &scratch_gva);
+  if (rc != 0) {
+    return rc;
   }
 
-  for (uint32_t y = 0; y < r->h; y++) {
-    int rc = v3d_g2d_present_gpu(&g_dev, sb + y * src_stride,
-                                 db + y * dst_stride, w32, 1);
-    if (rc != 0) {
-      return rc;
-    }
-  }
-  return 0;
+  /* 第 2 步：TFU 带 stride 贴上屏。
+   * 屏幕 pitch 是 3840 字节 = 1920 像素；内容宽 r->w 像素。
+   * 两者不同，正是必须用 TFU 的原因 —— GPU 内核是线性扫描，
+   * 直接写屏幕会破坏行对齐，逐行 dispatch 又会累计超时。 */
+  uint32_t dst_stride_px = g_screen.pitch / g_screen.cpp;
+  uint32_t db = FB_GVA + (r->dy * dst_stride_px + r->dx) * g_screen.cpp;
+  return v3d_tfu_copy_ex(&g_dev, scratch_gva, db, r->w, r->h, r->w,
+                         dst_stride_px, V3D_TEX_FORMAT_RGB565);
 }
 
 /* 把 (句柄, 宽度) 解析成 GPU VA 与行字节跨度。

@@ -59,9 +59,10 @@ int v3d_g2d_blit_gpu(v3d_dev_t* v, uint32_t src_gva, uint32_t dst_gva,
                      uint32_t w, uint32_t h);
 
 /* GPU 版 source-over 混合。a: 0..256。 */
-int v3d_g2d_present_gpu(v3d_dev_t* v, uint32_t src_gva,
-                        uint32_t dst_gva, uint32_t w,
-                        uint32_t h);
+/* 把 ARGB8888 转成紧凑 RGB565 写入 scratch 区，地址由 out_scratch_gva
+ * 回传；上屏由调用方用 TFU 完成（TFU 支持不同的源/目的 stride）。 */
+int v3d_g2d_present_gpu(v3d_dev_t* v, uint32_t src_gva, uint32_t w,
+                        uint32_t h, uint32_t* out_scratch_gva);
 int v3d_g2d_alpha_gpu(v3d_dev_t* v, uint32_t src_gva, uint32_t dst_gva,
                       uint32_t w, uint32_t h, uint32_t a);
 
