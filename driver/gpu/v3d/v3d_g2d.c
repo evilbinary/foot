@@ -30,7 +30,7 @@
 /* g2d 内核/逻辑的版本号 —— 每次改动 two_d.h 里的内核或本文件的调度逻辑就加一。
  * 启动那行会打印出来，用来确认板子上跑的是不是最新版（gpud.c 里的
  * __DATE__/__TIME__ 不可靠，因为那个文件不重编）。 */
-#define G2D_REV 69
+#define G2D_REV 72
 
 #define G2D_GVA_BASE 0x11000000UL
 #define G2D_UNIFORM_GVA (G2D_GVA_BASE + 8192UL)
@@ -72,13 +72,18 @@ enum {
   K_MINIC = 6,
   K_MINIC2 = 7,
   K_BLITV = 8,
-  K_ALPHAV = 9
+  K_ALPHAV = 9,
+  K_PRESENTV = 10
 };
 
 static struct {
   int inited;
   uint32_t num_qpus;
-  uint32_t kernel_gva[10];
+  /* 【必须 >= K_* 的最大值+1】曾经只有 10 个，而 K_PRESENTV = 10，
+   * 写 kernel_gva[10] 越界踩掉了紧随其后的 uniform_gva —— 症状是
+   * 所有 dispatch 的 cfg[6] 都是错的，连纯 CPU 的 alpha(cpu) 都读不到
+   * 数据（因为 GPU 从头就没干活）。留出余量到 16。 */
+  uint32_t kernel_gva[16];
   uint32_t uniform_gva;
   uint32_t uniform_va;
   uint32_t scratch_gva;
@@ -135,6 +140,11 @@ int v3d_g2d_init(v3d_dev_t* v) {
   memcpy(base + off, g2d_qpu_alpha_vec, (size_t)g2d_qpu_alpha_vec_n * 8);
   g_g2d.kernel_gva[K_ALPHAV] = G2D_GVA_BASE + off;
   off += (uint32_t)g2d_qpu_alpha_vec_n * 8;
+
+  /* ARGB8888 -> RGB565 打包（上屏用） */
+  memcpy(base + off, g2d_qpu_present_vec, (size_t)g2d_qpu_present_vec_n * 8);
+  g_g2d.kernel_gva[K_PRESENTV] = G2D_GVA_BASE + off;
+  off += (uint32_t)g2d_qpu_present_vec_n * 8;
 
   /* TMU 两个描述结构的固定位置 */
   g_g2d.texstate_gva = G2D_GVA_BASE + G2D_TEXSTATE_OFF;
@@ -727,3 +737,43 @@ int v3d_g2d_miniread(v3d_dev_t* v, uint32_t src_gva, uint32_t dst_gva,
   (void)v; (void)src_gva; (void)dst_gva; (void)src_w; (void)src_h;
   return -1;
 }
+
+/* 【ARGB8888 -> RGB565 上屏】
+ * 内核每 lane 处理 2 个源像素（8 字节）→ 写 1 个 32 位字（2 个 RGB565）。
+ * 之所以要凑 2 个像素：TMU 写是 32 位的，单个 16 位像素写不出去。
+ * 所以一次 dispatch 处理 16 lane × 2 = 32 像素。
+ *
+ * 要求 (w*h) % 32 == 0；否则由调用方把宽度补齐（见 v3d_present）。 */
+int v3d_g2d_present_gpu(v3d_dev_t* v, uint32_t src_gva, uint32_t dst_gva,
+                        uint32_t w, uint32_t h) {
+  if (!g_g2d.inited || src_gva == 0 || dst_gva == 0 || w == 0 || h == 0) {
+    return -1;
+  }
+  uint32_t rounds = (w * h) / 32u;
+  if (rounds == 0 || (w * h) % 32u != 0) {
+    return -2; /* 目前要求像素数是 32 的倍数 */
+  }
+
+  /* u0=src u1=dst u2=轮数 u3=源步长(128) u4=目的步长(64)
+   * u5..u7 = RGB565 掩码 */
+  uint32_t u[8];
+  u[0] = src_gva;
+  u[1] = dst_gva;
+  u[2] = rounds;
+  u[3] = 128u;   /* 16 lane × 8 字节 */
+  u[4] = 64u;    /* 16 lane × 4 字节 */
+  u[5] = 0xF800u;
+  u[6] = 0x07E0u;
+  u[7] = 0x001Fu;
+
+  {
+    volatile uint32_t* up = (volatile uint32_t*)(uintptr_t)g_g2d.uniform_va;
+    for (int i = 0; i < 16; i++) {
+      up[i] = 0;
+    }
+  }
+  memcpy((void*)(uintptr_t)g_g2d.uniform_va, u, sizeof(u));
+
+  return g2d_dispatch(v, K_PRESENTV, g_g2d.num_qpus, 1, 1);
+}
+

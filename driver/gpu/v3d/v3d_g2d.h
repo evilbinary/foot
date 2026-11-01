@@ -59,6 +59,9 @@ int v3d_g2d_blit_gpu(v3d_dev_t* v, uint32_t src_gva, uint32_t dst_gva,
                      uint32_t w, uint32_t h);
 
 /* GPU 版 source-over 混合。a: 0..256。 */
+int v3d_g2d_present_gpu(v3d_dev_t* v, uint32_t src_gva,
+                        uint32_t dst_gva, uint32_t w,
+                        uint32_t h);
 int v3d_g2d_alpha_gpu(v3d_dev_t* v, uint32_t src_gva, uint32_t dst_gva,
                       uint32_t w, uint32_t h, uint32_t a);
 

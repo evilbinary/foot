@@ -62,6 +62,11 @@
 #define FB_SRC_GVA 0x10020000UL /* 屏幕填充：RGB565 源行 GPU 虚拟地址 */
 #define FB_GVA 0x20000000UL
 
+/* 前置声明：自测代码里要调用这些后面才定义的 static 函数 */
+static int v3d_bo_create(void* args);
+static int v3d_bo_destroy(void* args);
+static int v3d_present(void* args);
+
 /* 读 aarch64 物理计数器，用于性能测量（cntfrq_el0 是频率） */
 static inline uint64_t g2d_rd_pct(void) {
   uint64_t v;
@@ -649,6 +654,33 @@ static int v3d_init(void) {
             int trc = v3d_tfu_copy_ex(&g_dev, G2D_TEST_GVA, FB_GVA, 256, 256,
                                       256, 1920, 6);
             printf("g2d onscreen: rc=%d (256x256 上屏到 0,0，RGB565)\n", trc);
+
+            /* 【PRESENT API 通路验证】走服务接口把 dst2 的 ARGB8888
+             * 直接打成 RGB565 上屏，验证 GPU 内核 + 句柄解析这条链路。
+             * 像素正确性靠肉眼（应与上面 TFU 那条几乎一样）。 */
+            {
+              gpu_bo_import_req ir;
+              memset(&ir, 0, sizeof(ir));
+              ir.pa = dpa;
+              ir.size = dsize;
+              ir.flags = GPU_BO_CACHED;
+              int ph = v3d_bo_create(&ir);
+              if (ph > 0) {
+                gpu_present_req pr;
+                memset(&pr, 0, sizeof(pr));
+                pr.src = (unsigned int)ph;
+                pr.w = 256;
+                pr.h = 256;
+                int prc = v3d_present(&pr);
+                printf("g2d api(present): rc=%d (256x256 ARGB8888 -> 屏幕 RGB565)\n",
+                       prc);
+                gpu_bo_ref br;
+                br.handle = (unsigned int)ph;
+                v3d_bo_destroy(&br);
+              } else {
+                printf("g2d api(present): 导入 BO 失败 (%d)\n", ph);
+              }
+            }
           }
 
           /* 【直接地址读】用 argb_copy 的真实机制（tmuc=0xFFFFFFFC +
@@ -906,6 +938,58 @@ static int v3d_submit_tfu(void* args) {
                          dst_stride, tex);
 }
 
+/* 【上屏】ARGB8888 画布 → 屏幕 RGB565。
+ *
+ * 每帧要有一次：屏幕是 16bpp、画布是 32bpp，格式不匹配必须转换。
+ * 这里把转换放到 GPU 上做（v3d_g2d_present_gpu），省掉 CPU 每帧
+ * 1920x1080 的 8.3MB 读 + 4.1MB 写。
+ *
+ * 对齐要求：内核每 lane 处理 2 个像素，一轮 32 像素，所以宽度必须是
+ * 32 的倍数。宽度不对齐时补齐会多读源数据，而源 stride 未知（BO 里
+ * 没记录），紧凑布局下会越界 —— 所以这里直接拒绝，由调用方保证对齐
+ * （1920 宽的整屏画布天然满足）。 */
+static int v3d_present(void* args) {
+  gpu_present_req* r = (gpu_present_req*)args;
+  if (r == NULL || r->w == 0 || r->h == 0 || r->src == 0) {
+    return -1;
+  }
+  if (!g_screen.inited) {
+    return -2;
+  }
+
+  int i = (int)r->src - 1;
+  if (i < 0 || i >= V3D_MAX_BOS || !g_bos[i].in_use) {
+    return -2;
+  }
+
+  uint32_t w32 = (r->w + 31u) & ~31u;
+  if (w32 != r->w) {
+    return -3; /* 宽度不是 32 的倍数：补齐会越界读源 */
+  }
+
+  uint32_t src_stride = r->w * 4u;      /* 源按紧凑 ARGB8888 */
+  uint32_t dst_stride = g_screen.pitch; /* 屏幕已是字节 stride */
+  if (dst_stride < w32 * 2u) {
+    return -3;
+  }
+
+  uint32_t sb = g_bos[i].gva + r->sy * src_stride + r->sx * 4u;
+  uint32_t db = FB_GVA + r->dy * dst_stride + r->dx * 2u;
+
+  if (src_stride == w32 * 4u && dst_stride == w32 * 2u) {
+    return v3d_g2d_present_gpu(&g_dev, sb, db, w32, r->h);
+  }
+
+  for (uint32_t y = 0; y < r->h; y++) {
+    int rc = v3d_g2d_present_gpu(&g_dev, sb + y * src_stride,
+                                 db + y * dst_stride, w32, 1);
+    if (rc != 0) {
+      return rc;
+    }
+  }
+  return 0;
+}
+
 /* 把 (句柄, 宽度) 解析成 GPU VA 与行字节跨度。
  * handle=0 表示屏幕；>0 查 BO 表。BO 里没有记录 stride，沿用紧凑假设
  * （每行 = w 像素），这也是 Wayland 合成画布的常见布局。 */
@@ -1030,7 +1114,7 @@ const gpu_backend_t v3d_backend = {
     .blit = v3d_blit,
     .sync = v3d_sync,
     .alpha = v3d_alpha,
-    .present = NULL, /* 上屏暂用 SUBMIT_TFU（同格式）*/
+    .present = v3d_present,
     /* 低层：BO 管理已实现；SUBMIT_CL/CSD 随阶段推进补 */
     .bo_create = v3d_bo_create,
     .bo_mmap = NULL, /* CPU 映射在应用侧（foot_cap_alloc_frame） */
