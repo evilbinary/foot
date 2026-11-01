@@ -23,3 +23,10 @@ target("systemd")
 set_type("cli")
 add_files("systemd.c") 
 add_deps("foot")
+
+# GPU 服务进程（仿 vfsd）：注册服务名 "gpu"，内部链接 GPU 后端库。
+# 默认 v3d 后端；mali 目前是空实现（占位），定义 GPU_USE_MALI 才启用。
+target("gpud")
+set_type("cli")
+add_files("gpud.c")
+add_deps("v3d", "mali", "foot")
