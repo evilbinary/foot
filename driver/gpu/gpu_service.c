@@ -34,6 +34,10 @@ static void* gpu_service_fn(void* fn, void* args) {
       return (void*)(long)(g_be->blit ? g_be->blit(args) : -1);
     case GPU_FN_SYNC:
       return (void*)(long)(g_be->sync ? g_be->sync(args) : 0);
+    case GPU_FN_ALPHA:
+      return (void*)(long)(g_be->alpha ? g_be->alpha(args) : -1);
+    case GPU_FN_PRESENT:
+      return (void*)(long)(g_be->present ? g_be->present(args) : -1);
 
     /* 低层（阶段 2+，为 Mesa 准备） */
     case GPU_LOW_GET_BO_OFFSET:

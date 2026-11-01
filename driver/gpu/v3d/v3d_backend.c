@@ -906,10 +906,110 @@ static int v3d_submit_tfu(void* args) {
                          dst_stride, tex);
 }
 
+/* 把 (句柄, 宽度) 解析成 GPU VA 与行字节跨度。
+ * handle=0 表示屏幕；>0 查 BO 表。BO 里没有记录 stride，沿用紧凑假设
+ * （每行 = w 像素），这也是 Wayland 合成画布的常见布局。 */
+static int v3d_resolve(uint32_t handle, uint32_t w, uint32_t* gva,
+                       uint32_t* stride4) {
+  if (handle == 0) {
+    if (!g_screen.inited) {
+      return -1;
+    }
+    *gva = FB_GVA;
+    *stride4 = g_screen.pitch; /* 屏幕 pitch 已是字节 */
+    return 0;
+  }
+  int i = (int)handle - 1;
+  if (i < 0 || i >= V3D_MAX_BOS || !g_bos[i].in_use) {
+    return -1;
+  }
+  *gva = g_bos[i].gva;
+  *stride4 = w * 4u;
+  return 0;
+}
+
+/* 【GPU blit】用自产的 copy_vec 内核做 1:1 拷贝。
+ *
+ * 内核要求一次处理的像素数是 16 的倍数，而 Wayland 窗口宽度几乎都不会
+ * 正好对齐 16。这里把宽度补齐到 16 的倍数（多拷最多 15 个像素），
+ * 前提是【目标行确实够宽】—— 补出来的那几个像素落在行尾 padding 里。
+ * 若 dst 是紧凑布局且宽度未对齐，就拒绝（返回 -3），以免写坏邻接内容。 */
 static int v3d_blit(void* args) {
-  (void)args;
-  /* TODO：阶段 2 用 TFU copy（src_stride != 0）实现 */
-  return -1;
+  gpu_blit_req* r = (gpu_blit_req*)args;
+  if (r == NULL || r->w == 0 || r->h == 0) {
+    return -1;
+  }
+
+  uint32_t sg, dg, ss, ds;
+  if (v3d_resolve(r->src, r->w, &sg, &ss) != 0) {
+    return -2;
+  }
+  if (v3d_resolve(r->dst, r->w, &dg, &ds) != 0) {
+    return -2;
+  }
+
+  uint32_t w16 = (r->w + 15u) & ~15u;
+  if (ds < w16 * 4u) {
+    return -3; /* 目标行不足，补齐会越界 */
+  }
+
+  uint32_t sb = sg + r->sy * ss + r->sx * 4u;
+  uint32_t db = dg + r->dy * ds + r->dx * 4u;
+
+  if (ss == w16 * 4u && ds == w16 * 4u) {
+    /* 两边都紧凑且已对齐 → 一次整块拷贝 */
+    return v3d_g2d_blit_gpu(&g_dev, sb, db, w16, r->h);
+  }
+
+  /* 否则逐行（每行宽度已对齐，满足内核要求） */
+  for (uint32_t y = 0; y < r->h; y++) {
+    int rc = v3d_g2d_blit_gpu(&g_dev, sb + y * ss, db + y * ds, w16, 1);
+    if (rc != 0) {
+      return rc;
+    }
+  }
+  return 0;
+}
+
+/* 【GPU alpha】source-over 混合：dst = src*a + dst*(1-a)，a 取 0..256。
+ * 宽度补齐与 v3d_blit 同理。 */
+static int v3d_alpha(void* args) {
+  gpu_alpha_req* r = (gpu_alpha_req*)args;
+  if (r == NULL || r->w == 0 || r->h == 0) {
+    return -1;
+  }
+  if (r->alpha == 0) {
+    return 0; /* 全透明 = 无操作 */
+  }
+
+  uint32_t sg, dg, ss, ds;
+  if (v3d_resolve(r->src, r->w, &sg, &ss) != 0) {
+    return -2;
+  }
+  if (v3d_resolve(r->dst, r->w, &dg, &ds) != 0) {
+    return -2;
+  }
+
+  uint32_t w16 = (r->w + 15u) & ~15u;
+  if (ds < w16 * 4u) {
+    return -3;
+  }
+
+  uint32_t a = (r->alpha > 256u) ? 256u : r->alpha;
+  uint32_t sb = sg + r->sy * ss + r->sx * 4u;
+  uint32_t db = dg + r->dy * ds + r->dx * 4u;
+
+  if (ss == w16 * 4u && ds == w16 * 4u) {
+    return v3d_g2d_alpha_gpu(&g_dev, sb, db, w16, r->h, a);
+  }
+
+  for (uint32_t y = 0; y < r->h; y++) {
+    int rc = v3d_g2d_alpha_gpu(&g_dev, sb + y * ss, db + y * ds, w16, 1, a);
+    if (rc != 0) {
+      return rc;
+    }
+  }
+  return 0;
 }
 
 static int v3d_sync(void* args) {
@@ -929,6 +1029,8 @@ const gpu_backend_t v3d_backend = {
     .fill = v3d_fill,
     .blit = v3d_blit,
     .sync = v3d_sync,
+    .alpha = v3d_alpha,
+    .present = NULL, /* 上屏暂用 SUBMIT_TFU（同格式）*/
     /* 低层：BO 管理已实现；SUBMIT_CL/CSD 随阶段推进补 */
     .bo_create = v3d_bo_create,
     .bo_mmap = NULL, /* CPU 映射在应用侧（foot_cap_alloc_frame） */

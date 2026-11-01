@@ -26,6 +26,8 @@ enum gpu_fn {
   GPU_FN_FILL = 1,  /* args = gpu_fill_req* */
   GPU_FN_BLIT = 2,  /* args = gpu_blit_req* */
   GPU_FN_SYNC = 3,  /* args = NULL（等 GPU 空闲） */
+  GPU_FN_ALPHA = 4, /* args = gpu_alpha_req*（source-over 混合） */
+  GPU_FN_PRESENT = 5, /* args = gpu_present_req*（ARGB8888→屏幕格式并上屏） */
 };
 
 /* ---------------- 低层方法号（可选，为 Mesa 准备） ---------------- */
@@ -125,6 +127,32 @@ typedef struct {
 
 #define GPU_BLIT_ASYNC (1u << 0)
 
+/* 【alpha 混合】dst = src*a + dst*(1-a)，逐通道。
+ * alpha 取值 0..256（256 = 完全不透明）。src/dst 句柄 0 表示屏幕。 */
+typedef struct {
+  unsigned int src;
+  unsigned int dst;
+  unsigned int sx, sy; /* 源坐标 */
+  unsigned int dx, dy; /* 目标坐标 */
+  unsigned int w, h;
+  unsigned int alpha; /* 0..256 */
+  unsigned int flags;
+} gpu_alpha_req;
+
+#define GPU_ALPHA_ASYNC (1u << 0)
+
+/* 【上屏】把一块 ARGB8888（或指定格式）的 buffer 贴到屏幕。
+ * 内部做格式转换（ARGB8888 -> RGB565），因为屏幕是 16bpp。 */
+typedef struct {
+  unsigned int src;      /* 源句柄（0 表示屏幕自身，非法） */
+  unsigned int sx, sy;
+  unsigned int dx, dy;   /* 屏幕坐标 */
+  unsigned int w, h;
+  unsigned int src_fmt;  /* GPU_FMT_*，0 = ARGB8888 */
+  unsigned int flags;
+} gpu_present_req;
+
+
 /* ---------------- 后端抽象 ---------------- */
 typedef struct gpu_backend {
   const char* name;     /* "v3d" */
@@ -137,6 +165,8 @@ typedef struct gpu_backend {
   int (*fill)(void* args); /* args = gpu_fill_req* */
   int (*blit)(void* args); /* args = gpu_blit_req* */
   int (*sync)(void* args); /* 等 GPU 空闲 */
+  int (*alpha)(void* args);   /* args = gpu_alpha_req* */
+  int (*present)(void* args); /* args = gpu_present_req* */
 
   /* 低层：不支持则置 NULL */
   int (*bo_create)(void* args); /* 导入已有 pa，返回 handle */
