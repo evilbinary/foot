@@ -31,6 +31,10 @@
 #define PM_MAP_VA 0x41000000UL
 #define PT_VA 0x42000000UL      /* 4MB 单级页表映射区 */
 #define SCRATCH_VA 0x43000000UL /* MMU 未映射访问的落点页 */
+#define SH_VA 0x44000000UL      /* shader 代码页 CPU 映射 */
+#define UNI_VA 0x44100000UL     /* uniform 页 CPU 映射 */
+#define SHADER_GVA 0x10000000UL /* shader 的 GPU 虚拟地址 */
+#define UNIFORM_GVA 0x10001000UL /* uniform 的 GPU 虚拟地址 */
 
 static volatile uint32_t* g_v3d_va;
 static v3d_dev_t g_dev;
@@ -144,6 +148,60 @@ int main(int argc, char* argv[]) {
       int lrc = v3d_l2c_enable(&g_dev);
       printf("v3dd: L2C enable rc=%d l2cactl=0x%08x\n", lrc,
              v3d_l2c_status(&g_dev));
+
+      /* 7b) P3：最小 CSD job 自检，shader = "nop ; nop ; thrsw"（线程结束）。
+       * QPU 是 64 位指令：add=NOP(0xBB) | mul=NOP(0xE) | sig=THRSW(1)。
+       * 只做 1 个 workgroup × 16 线程，不访问任何 buffer，纯粹验证 CSD 通路。 */
+      uint32_t sh_pa = 0, sh_size = 0, uni_pa = 0, uni_size = 0;
+      foot_cap_t shcap =
+          foot_cap_alloc_arena(V3D_MMU_PAGE_SIZE, 0, 0, &sh_pa, &sh_size);
+      foot_cap_t unicap =
+          foot_cap_alloc_arena(V3D_MMU_PAGE_SIZE, 0, 0, &uni_pa, &uni_size);
+      if (shcap != FOOT_CAP_NONE && unicap != FOOT_CAP_NONE &&
+          foot_cap_map(shcap, (void*)SH_VA, 0, sh_size) == 0 &&
+          foot_cap_map(unicap, (void*)UNI_VA, 0, uni_size) == 0) {
+        volatile uint32_t* sh = (volatile uint32_t*)SH_VA;
+        volatile uint32_t* uni = (volatile uint32_t*)UNI_VA;
+
+        /* nop(waddr=0) ; nop(waddr=0) ; thrsw —— 单段模式的 program-end */
+        sh[0] = 0xBB03F000u; /* bits[31:0]  */
+        sh[1] = 0x38200000u; /* bits[63:32] */
+        foot_cache_clean((void*)sh, (void*)(SH_VA + 8));
+
+        for (int i = 0; i < 1024; i++) {
+          uni[i] = 0;
+        }
+        foot_cache_clean((void*)uni, (void*)(UNI_VA + V3D_MMU_PAGE_SIZE));
+
+        /* 把 shader / uniform 页映射进 GPU 地址空间，再 flush 页表 */
+        v3d_mmu_map_page(pt, SHADER_GVA, sh_pa);
+        v3d_mmu_map_page(pt, UNIFORM_GVA, uni_pa);
+        foot_cache_clean((void*)pt, (void*)(PT_VA + V3D_MMU_PT_BYTES));
+        v3d_mmu_flush(&g_dev);
+
+        /* 1 workgroup × 16 线程 */
+        uint32_t cfg[7] = {0};
+        cfg[0] = 1u << 16; /* NUM_WGS_X = 1 */
+        cfg[1] = 1u << 16; /* NUM_WGS_Y = 1 */
+        cfg[2] = 1u << 16; /* NUM_WGS_Z = 1 */
+        cfg[3] = (1u << 8) | (0u << 12) | (16u << 0); /* wgs_per_sg/batches/wg_size */
+        cfg[4] = 0;           /* num_batches = 1（7.1.6 前是减 1） */
+        cfg[5] = SHADER_GVA | V3D_CSD_CFG5_SINGLE_SEG; /* shader VA + 单段 */
+        cfg[6] = UNIFORM_GVA; /* uniform 地址（GPU VA，4 字节对齐） */
+
+        printf("v3dd: CSD cfg=[%08x %08x %08x %08x %08x %08x %08x]\n", cfg[0],
+               cfg[1], cfg[2], cfg[3], cfg[4], cfg[5], cfg[6]);
+        v3d_csd_submit(&g_dev, cfg);
+        int crc = v3d_csd_wait_idle(&g_dev, 1000);
+        printf(
+            "v3dd: CSD job rc=%d status=0x%08x cur_cfg4=0x%08x vio_addr=0x%08x "
+            "vio_id=0x%08x\n",
+            crc, v3d_csd_status(&g_dev),
+            *(volatile uint32_t*)(g_dev.core0 + V3D_CSD_CURRENT_CFG4 / 4),
+            v3d_mmu_vio_addr(&g_dev), v3d_mmu_vio_id(&g_dev));
+      } else {
+        printf("v3dd: CSD selftest skipped (alloc/map failed)\n");
+      }
     }
   }
 

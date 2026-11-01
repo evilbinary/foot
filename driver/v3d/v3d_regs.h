@@ -151,6 +151,9 @@
 
 #define V3D_CSD_QUEUED_CFG4 0x00940u /* 批次数（7.1.6 前为 "减 1"） */
 #define V3D_CSD_QUEUED_CFG5 0x00944u /* shader 地址记录 */
+#define V3D_CSD_CFG5_THREADING (1u << 0)      /* 4 线程/段 */
+#define V3D_CSD_CFG5_SINGLE_SEG (1u << 1)     /* 单段（无中间 thread switch） */
+#define V3D_CSD_CFG5_PROPAGATE_NANS (1u << 2) /* V3D 7.x 保留（不再使用） */
 #define V3D_CSD_QUEUED_CFG6 0x00948u /* uniform 地址（4 字节对齐） */
 #define V3D_CSD_QUEUED_CFG7 0x0094cu /* V3D 7.x only，未用需置 0 */
 
