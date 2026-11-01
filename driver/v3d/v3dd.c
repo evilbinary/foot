@@ -19,7 +19,9 @@
 #include <stdio.h>
 
 #include "client.h"
+#include "v3d_csd.h"
 #include "v3d_hw.h"
+#include "v3d_mmu.h"
 #include "v3d_regs.h"
 
 /* 映射目标 VA：页对齐、远低于用户代码段（EXEC_ADDR），落在 MMIO 直通区。
@@ -27,6 +29,8 @@
  * 缺页重映射冲突。page_destroy 不扫 EXEC_ADDR 以下，进程退出也不会误回收。 */
 #define V3D_MAP_VA 0x40000000UL
 #define PM_MAP_VA 0x41000000UL
+#define PT_VA 0x42000000UL      /* 4MB 单级页表映射区 */
+#define SCRATCH_VA 0x43000000UL /* MMU 未映射访问的落点页 */
 
 static volatile uint32_t* g_v3d_va;
 static v3d_dev_t g_dev;
@@ -101,7 +105,52 @@ int main(int argc, char* argv[]) {
   v3d_ident(&g_dev, &ver, &ncores, &iprev);
   printf("v3dd: ident ver=%u ncores=%u iprev=%u\n", ver, ncores, iprev);
 
-  /* 7) 注册服务并进入服务循环 */
+  /* 7) P2：MMU（单级 4MB 页表）+ L2C */
+  {
+    uint32_t pt_pa = 0, pt_size = 0;
+    uint32_t scratch_pa = 0, scratch_size = 0;
+
+    foot_cap_t ptcap =
+        foot_cap_alloc_arena(V3D_MMU_PT_BYTES, 0, 0, &pt_pa, &pt_size);
+    if (ptcap == FOOT_CAP_NONE) {
+      printf("v3dd: alloc page table failed (want %u bytes)\n",
+             (unsigned)V3D_MMU_PT_BYTES);
+    } else if (foot_cap_map(ptcap, (void*)PT_VA, 0, pt_size) != 0) {
+      printf("v3dd: map page table failed\n");
+    } else {
+      /* scratch：未映射访问的落点页，避免 GPU 越界打穿物理内存 */
+      foot_cap_t sc = foot_cap_alloc_arena(V3D_MMU_PAGE_SIZE, 0, 0, &scratch_pa,
+                                           &scratch_size);
+      if (sc == FOOT_CAP_NONE ||
+          foot_cap_map(sc, (void*)SCRATCH_VA, 0, scratch_size) != 0) {
+        printf("v3dd: alloc/map scratch failed, ILLEGAL_ADDR disabled\n");
+        scratch_pa = 0;
+      }
+
+      /* 页表清零（全 invalid）→ cache clean → 编程 MMU */
+      volatile uint32_t* pt = (volatile uint32_t*)PT_VA;
+      for (uint32_t i = 0; i < V3D_MMU_PT_ENTRIES; i++) {
+        pt[i] = 0;
+      }
+      foot_cache_clean((void*)pt, (void*)(PT_VA + V3D_MMU_PT_BYTES));
+
+      int mrc = v3d_mmu_setup(&g_dev, pt, pt_pa, scratch_pa);
+      printf("v3dd: MMU setup rc=%d pt_pa=0x%08x pt_size=%u scratch_pa=0x%08x\n",
+             mrc, pt_pa, pt_size, scratch_pa);
+      printf("v3dd: MMU ctl=0x%08x mmuc=0x%08x debug=0x%08x\n",
+             v3d_mmu_ctl(&g_dev), v3d_mmuc_control(&g_dev),
+             v3d_mmu_debug_info(&g_dev));
+
+      int lrc = v3d_l2c_enable(&g_dev);
+      printf("v3dd: L2C enable rc=%d l2cactl=0x%08x\n", lrc,
+             v3d_l2c_status(&g_dev));
+    }
+  }
+
+  /* 8) P3：CSD 通路探活（此时没有提交，CSD_STATUS 应为 0 = 空闲） */
+  printf("v3dd: CSD status=0x%08x\n", v3d_csd_status(&g_dev));
+
+  /* 9) 注册服务并进入服务循环 */
   client_t* client = client_regist("v3d");
   if (client == NULL) {
     printf("v3dd: client_regist(v3d) failed\n");

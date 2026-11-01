@@ -12,5 +12,7 @@ set_type("cli")
 add_deps("foot")
 add_files(
     'v3dd.c',
-    'v3d_hw.c'
+    'v3d_hw.c',
+    'v3d_mmu.c',
+    'v3d_csd.c'
 )

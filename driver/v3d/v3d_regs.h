@@ -32,6 +32,65 @@
 #define V3D_HUB_INT_STS 0x00050u
 #define V3D_HUB_INT_CLR 0x00058u
 
+/* ---- MMU（hub 窗口；对照 Linux drm/v3d/v3d_regs.h）----
+ *   0x01000 MMUC_CONTROL  MMU 控制器（ENABLE / FLUSH）
+ *   0x01200 MMU_CTL       MMU 主控制（ENABLE / TLB_CLEAR / 各类 fault 动作）
+ *   0x01204 MMU_PT_PA_BASE 单级页表物理基址（写 PFN = pa>>12）
+ *   0x0122c VIO_ID        触发越界的 AXI master id
+ *   0x01230 ILLEGAL_ADDR  未映射访问重定向到的 scratch 页（PFN | bit31 ENABLE）
+ *   0x01234 VIO_ADDR      触发越界的虚拟地址
+ *   0x01238 DEBUG_INFO    MMU 版本 / PA/VA 位宽
+ *
+ * 页表是【单级】的：V3D 4GB 地址空间 / 4KB 页 = 1M 个 u32 表项 = 4MB 连续内存。
+ * 表项格式：[27:0]=PFN(pa>>12)，bit28=VALID，bit29=WRITEABLE，
+ *          bit30=BIGPAGE(64KB)，bit31=SUPERPAGE(1MB)。 */
+#define V3D_MMUC_CONTROL 0x01000u
+#define V3D_MMUC_CONTROL_ENABLE (1u << 0)
+#define V3D_MMUC_CONTROL_FLUSH (1u << 1)
+#define V3D_MMUC_CONTROL_FLUSHING (1u << 2)
+#define V3D_MMUC_CONTROL_CLEAR (1u << 11) /* V3D 7.1+；旧版是 bit3 */
+
+#define V3D_MMU_CTL 0x01200u
+#define V3D_MMU_CTL_ENABLE (1u << 0)
+#define V3D_MMU_CTL_TLB_STATS_ENABLE (1u << 1)
+#define V3D_MMU_CTL_TLB_CLEAR (1u << 2)
+#define V3D_MMU_CTL_TLB_STATS_CLEAR (1u << 3)
+#define V3D_MMU_CTL_TLB_CLEARING (1u << 7)
+#define V3D_MMU_CTL_WRITE_VIOLATION_INT (1u << 10)
+#define V3D_MMU_CTL_WRITE_VIOLATION_ABORT (1u << 11)
+#define V3D_MMU_CTL_WRITE_VIOLATION (1u << 12)
+#define V3D_MMU_CTL_PT_INVALID_ENABLE (1u << 16)
+#define V3D_MMU_CTL_PT_INVALID_INT (1u << 18)
+#define V3D_MMU_CTL_PT_INVALID_ABORT (1u << 19)
+#define V3D_MMU_CTL_PT_INVALID (1u << 20)
+#define V3D_MMU_CTL_CAP_EXCEEDED_INT (1u << 25)
+#define V3D_MMU_CTL_CAP_EXCEEDED_ABORT (1u << 26)
+#define V3D_MMU_CTL_CAP_EXCEEDED (1u << 27)
+
+#define V3D_MMU_PT_PA_BASE 0x01204u
+#define V3D_MMU_VIO_ID 0x0122cu
+#define V3D_MMU_ILLEGAL_ADDR 0x01230u
+#define V3D_MMU_ILLEGAL_ADDR_ENABLE (1u << 31)
+#define V3D_MMU_VIO_ADDR 0x01234u
+#define V3D_MMU_DEBUG_INFO 0x01238u
+#define V3D_MMU_DEBUG_VERSION_SHIFT 0
+#define V3D_MMU_DEBUG_VERSION_MASK 0xFu
+#define V3D_MMU_DEBUG_VA_WIDTH_SHIFT 4
+#define V3D_MMU_DEBUG_VA_WIDTH_MASK 0xF0u
+#define V3D_MMU_DEBUG_PA_WIDTH_SHIFT 8
+#define V3D_MMU_DEBUG_PA_WIDTH_MASK 0xF00u
+
+/* 单级页表项 / 位移 */
+#define V3D_MMU_PAGE_SHIFT 12
+#define V3D_MMU_PAGE_SIZE (1u << V3D_MMU_PAGE_SHIFT)
+#define V3D_MMU_PT_ENTRIES 0x100000u              /* 4GB / 4KB */
+#define V3D_MMU_PT_BYTES (V3D_MMU_PT_ENTRIES * 4u) /* 4MB */
+#define V3D_PTE_SUPERPAGE (1u << 31)
+#define V3D_PTE_BIGPAGE (1u << 30)
+#define V3D_PTE_WRITEABLE (1u << 29)
+#define V3D_PTE_VALID (1u << 28)
+#define V3D_PTE_PFN_MASK 0x0FFFFFFFu
+
 /* ---- core0 寄存器 ---- */
 #define V3D_CTL_IDENT0 0x00000u
 #define V3D_CTL_IDENT1 0x00004u /* NSEM/NTMU/QUPS/NSLC/REV */
@@ -43,6 +102,67 @@
 #define V3D_INT_CSDDONE (1u << 6) /* 7.1 的 CSD_DONE 是 bit6 */
 #define V3D_CTL_INT_MSK_SET 0x00060u
 #define V3D_CTL_INT_MSK_CLR 0x00064u
+
+/* ---- CSD（计算着色器分发，core0 窗口；V3D 7.x 偏移）----
+ * 提交流程（对照 Linux drm/v3d/v3d_sched.c: v3d_csd_job_run）：
+ *   写 CFG1..CFG6 → 写 CFG7（7.x 置 0）→ 最后写 CFG0 触发 job。
+ * CFG0..CFG2 = 各维 workgroup 数（高 16 位）+ 偏移（低 16 位）。
+ * CFG3 = WG_SIZE(7:0) | WGS_PER_SG(11:8) | BATCHES_PER_SG_M1(19:12)
+ *       | MAX_SG_ID(25:20) | OVERLAP(26)。
+ * CFG4 = 批次数（V3D 7.1.6 以前是 "减 1"）。
+ * CFG5 = shader 地址记录（地址 + pnan/singleseg/threading 标志）。
+ * CFG6 = uniform 地址（4 字节对齐）。 */
+#define V3D_CSD_STATUS 0x00900u
+#define V3D_CSD_STATUS_NUM_COMPLETED_SHIFT 4
+#define V3D_CSD_STATUS_NUM_COMPLETED_MASK 0xFF0u
+#define V3D_CSD_STATUS_NUM_ACTIVE_SHIFT 2
+#define V3D_CSD_STATUS_NUM_ACTIVE_MASK 0xCu
+#define V3D_CSD_STATUS_HAVE_CURRENT (1u << 1)
+#define V3D_CSD_STATUS_HAVE_QUEUED (1u << 0)
+
+#define V3D_CSD_QUEUED_CFG0 0x00930u
+#define V3D_CSD_CFG0_NUM_WGS_X_SHIFT 16
+#define V3D_CSD_CFG0_NUM_WGS_X_MASK 0xFFFF0000u
+#define V3D_CSD_CFG0_WG_X_OFFSET_SHIFT 0
+#define V3D_CSD_CFG0_WG_X_OFFSET_MASK 0x0000FFFFu
+
+#define V3D_CSD_QUEUED_CFG1 0x00934u
+#define V3D_CSD_CFG1_NUM_WGS_Y_SHIFT 16
+#define V3D_CSD_CFG1_NUM_WGS_Y_MASK 0xFFFF0000u
+#define V3D_CSD_CFG1_WG_Y_OFFSET_SHIFT 0
+#define V3D_CSD_CFG1_WG_Y_OFFSET_MASK 0x0000FFFFu
+
+#define V3D_CSD_QUEUED_CFG2 0x00938u
+#define V3D_CSD_CFG2_NUM_WGS_Z_SHIFT 16
+#define V3D_CSD_CFG2_NUM_WGS_Z_MASK 0xFFFF0000u
+#define V3D_CSD_CFG2_WG_Z_OFFSET_SHIFT 0
+#define V3D_CSD_CFG2_WG_Z_OFFSET_MASK 0x0000FFFFu
+
+#define V3D_CSD_QUEUED_CFG3 0x0093cu
+#define V3D_CSD_CFG3_WG_SIZE_SHIFT 0
+#define V3D_CSD_CFG3_WG_SIZE_MASK 0x000000FFu
+#define V3D_CSD_CFG3_WGS_PER_SG_SHIFT 8
+#define V3D_CSD_CFG3_WGS_PER_SG_MASK 0x00000F00u
+#define V3D_CSD_CFG3_BATCHES_PER_SG_M1_SHIFT 12
+#define V3D_CSD_CFG3_BATCHES_PER_SG_M1_MASK 0x000FF000u
+#define V3D_CSD_CFG3_MAX_SG_ID_SHIFT 20
+#define V3D_CSD_CFG3_MAX_SG_ID_MASK 0x03F00000u
+#define V3D_CSD_CFG3_OVERLAP_WITH_PREV (1u << 26)
+
+#define V3D_CSD_QUEUED_CFG4 0x00940u /* 批次数（7.1.6 前为 "减 1"） */
+#define V3D_CSD_QUEUED_CFG5 0x00944u /* shader 地址记录 */
+#define V3D_CSD_QUEUED_CFG6 0x00948u /* uniform 地址（4 字节对齐） */
+#define V3D_CSD_QUEUED_CFG7 0x0094cu /* V3D 7.x only，未用需置 0 */
+
+#define V3D_CSD_CURRENT_CFG0 0x00958u
+#define V3D_CSD_CURRENT_CFG1 0x0095cu
+#define V3D_CSD_CURRENT_CFG2 0x00960u
+#define V3D_CSD_CURRENT_CFG3 0x00964u
+#define V3D_CSD_CURRENT_CFG4 0x00968u
+#define V3D_CSD_CURRENT_CFG5 0x0096cu
+#define V3D_CSD_CURRENT_CFG6 0x00970u
+#define V3D_CSD_CURRENT_ID0 0x00978u
+#define V3D_CSD_CURRENT_ID1 0x0097cu
 
 /* ---- SMS 电源状态机（相对 V3D_SMS_OFF）---- */
 #define V3D_SMS_REE_CS 0x000u
