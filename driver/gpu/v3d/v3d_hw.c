@@ -89,3 +89,76 @@ void v3d_ident(v3d_dev_t* v, uint32_t* ver, uint32_t* ncores, uint32_t* iprev) {
     *iprev = (ident3 >> V3D_HUB_IDENT3_IPREV_SHIFT) & V3D_HUB_IDENT3_IPREV_MASK;
   }
 }
+
+/* 失效 slice cache + 整个 L2T（Linux v3d_invalidate_caches 的 7.1 等价物：
+ * ver>=41 跳过 L3 flush、ver>=33 跳过 L2C invalidate，只剩这两步）。
+ *
+ * 【为什么必须在 CSD 提交前做】QPU 取指令、读 uniform 都经过 L2T/slice
+ * cache。若里面残留上一次 job 的行（或上电后的未初始化状态），QPU 会把
+ * 指令流读错，硬件既不报 MMU fault 也不前进 NUM_COMPLETED —— 表现就是
+ * "CFG0 写下去了，job 却像没发生"。 */
+void v3d_invalidate_caches(v3d_dev_t* v) {
+  if (v == NULL || v->core0 == NULL) {
+    return;
+  }
+  volatile uint32_t* core = v->core0;
+
+  /* 1) slice cache：TVCCS / TDCCS / UCC / ICC 各 0xf（= 全部失效） */
+  wr32(core + V3D_CTL_SLCACTL / 4,
+       (0xfu << V3D_SLCACTL_TVCCS_SHIFT) | (0xfu << V3D_SLCACTL_TDCCS_SHIFT) |
+           (0xfu << V3D_SLCACTL_UCC_SHIFT) | (0xfu << V3D_SLCACTL_ICC_SHIFT));
+
+  /* 2) L2T：区间设成整个地址空间，FLM_FLUSH（只失效、不写回），
+   *    写 L2TFLS 触发；忙位由硬件自清。 */
+  wr32(core + V3D_CTL_L2TFLSTA / 4, 0u);
+  wr32(core + V3D_CTL_L2TFLEND / 4, 0xFFFFFFFFu);
+  wr32(core + V3D_CTL_L2TCACTL / 4,
+       V3D_L2TCACTL_L2TFLS |
+           (V3D_L2TCACTL_FLM_FLUSH << V3D_L2TCACTL_FLM_SHIFT));
+
+  for (int i = 0; i < 1000; i++) {
+    if (!(rd32(core + V3D_CTL_L2TCACTL / 4) & V3D_L2TCACTL_L2TFLS)) {
+      break;
+    }
+    usleep(100);
+  }
+}
+
+/* 把 L2T 的脏行写回 DRAM（FLM_CLEAN），并先排空 TMU 写合并缓冲。
+ * 对应 Linux v3d_clean_caches() / EwokOS g2d_caches_clean()。
+ *
+ * 【为什么必须有】CSD 写完的结果先落在 L2T，不一定马上进 DRAM。而
+ * v3d_invalidate_caches 用的是 FLM_FLUSH（只失效、不写回）——如果下一
+ * 次 dispatch 前直接 invalidate，上一次的结果会被【丢弃】。实测现象：
+ *   fill（只写，不读源）  → 一直正常
+ *   copy/alpha（要读源）  → 永远读回 0，写出来也是 0
+ * 所以每次 job 完成、结果还在 L2T 里时，必须先 clean 再交给下一次使用。 */
+void v3d_clean_caches(v3d_dev_t* v) {
+  if (v == NULL || v->core0 == NULL) {
+    return;
+  }
+  volatile uint32_t* core = v->core0;
+
+  /* 1) 排空 TMU 写合并缓冲（Linux 在 clean 前必做，GFXH-1897） */
+  wr32(core + V3D_CTL_L2TCACTL / 4, V3D_L2TCACTL_TMUWCF);
+  for (int i = 0; i < 1000; i++) {
+    if (!(rd32(core + V3D_CTL_L2TCACTL / 4) & V3D_L2TCACTL_TMUWCF)) {
+      break;
+    }
+    usleep(10);
+  }
+
+  /* 2) L2T 写回：FLM_CLEAN（写回脏行、标干净，不失效） */
+  wr32(core + V3D_CTL_L2TFLSTA / 4, 0u);
+  wr32(core + V3D_CTL_L2TFLEND / 4, 0xFFFFFFFFu);
+  wr32(core + V3D_CTL_L2TCACTL / 4,
+       V3D_L2TCACTL_L2TFLS |
+           (V3D_L2TCACTL_FLM_CLEAN << V3D_L2TCACTL_FLM_SHIFT));
+
+  for (int i = 0; i < 2000; i++) {
+    if (!(rd32(core + V3D_CTL_L2TCACTL / 4) & V3D_L2TCACTL_L2TFLS)) {
+      break;
+    }
+    usleep(100);
+  }
+}

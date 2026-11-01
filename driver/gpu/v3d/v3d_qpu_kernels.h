@@ -681,4 +681,248 @@ const uint64_t g2d_qpu_argb_fill[] = {
 };
 const unsigned g2d_qpu_argb_fill_n = 96;
 
+/* argb_copy：专门的 1:1 拷贝内核（不含仿射采样）*/
+const uint64_t g2d_qpu_argb_copy[] = {
+    0x39800000bb03f000ULL,  /*   nop */
+    0x39804000bb03f000ULL,  /*   nop */
+    0x39808000bb03f000ULL,  /*   nop */
+    0x3980c000bb03f000ULL,  /*   nop */
+    0x39810000bb03f000ULL,  /*   nop */
+    0x39814000bb03f000ULL,  /*   nop */
+    0x39818000bb03f000ULL,  /*   nop */
+    0x3981c000bb03f000ULL,  /*   nop */
+    0x39820000bb03f000ULL,  /*   nop */
+    0x39824000bb03f000ULL,  /*   nop */
+    0x39828000bb03f000ULL,  /*   nop */
+    0x38000011bb03f002ULL,  /*   eidx */
+    0x39e0000b7c03f444ULL,  /*   shl */
+    0x3800000a3803f28bULL,  /*   add */
+    0x39c0000ff903f703ULL,  /*   mov */
+    0x39c00010f903f043ULL,  /*   mov */
+    0x39e000107c03f408ULL,  /*   shl */
+    0x38000011bb03f001ULL,  /*   tidx */
+    0x39e000117d03f442ULL,  /*   shr */
+    0x39e00011b503f44fULL,  /*   and */
+    0x39e000123803f441ULL,  /*   add */
+    0x39e040123c03f481ULL,  /*   sub */
+    0x02ffffddff00d000ULL,  /*   branch ANYNA */
+    0x38000000bb03f000ULL,  /*   nop */
+    0x38000000bb03f000ULL,  /*   nop */
+    0x38000000bb03f000ULL,  /*   nop */
+    0x39e000127c03f448ULL,  /*   shl */
+    0x3800000a3803f292ULL,  /*   add */
+    0x24000480bb448000ULL,  /*   nop */
+    0x380000003803f012ULL,  /*   add */
+    0x24000480bb449000ULL,  /*   nop */
+    0x380000013803f052ULL,  /*   add */
+    0x24000480bb447000ULL,  /*   nop */
+    0x380000123c03f192ULL,  /*   sub */
+    0x39e080133c03f481ULL,  /*   sub */
+    0x020001a60000d000ULL,  /*   branch ANYA */
+    0x38000000bb03f000ULL,  /*   nop */
+    0x38000000bb03f000ULL,  /*   nop */
+    0x38000000bb03f000ULL,  /*   nop */
+    0x380000067803f1d2ULL,  /*   min */
+    0x38200000bb03f000ULL,  /*   nop */
+    0x38000000bb03f000ULL,  /*   nop */
+    0x38000000bb03f000ULL,  /*   nop */
+    0x3800000d3803f00bULL,  /*   add */
+    0x3800000e3803f04bULL,  /*   add */
+    0x380000003803f002ULL,  /*   add */
+    0x380000013803f043ULL,  /*   add */
+    0x38001020f903f3c3ULL,  /*   mov */
+    0x3800100cf903f383ULL,  /*   mov */
+    0x3800000e3803f390ULL,  /*   add */
+    0x3800000cf903f103ULL,  /*   mov */
+    0x39e040113c03f100ULL,  /*   sub */
+    0x0200008c0000d000ULL,  /*   branch ALLA */
+    0x38000000bb03f000ULL,  /*   nop */
+    0x38000000bb03f000ULL,  /*   nop */
+    0x38000000bb03f000ULL,  /*   nop */
+    0x38001020f903f3c3ULL,  /*   mov */
+    0x3800100cf903f383ULL,  /*   mov */
+    0x3800000e3803f390ULL,  /*   add */
+    0x38850000bb03f000ULL,  /*   nop */
+    0x38854000bb03f000ULL,  /*   nop */
+    0x38858000bb03f000ULL,  /*   nop */
+    0x3885c000bb03f000ULL,  /*   nop */
+    0x38001020f903f3c3ULL,  /*   mov */
+    0x3800100bf903f503ULL,  /*   mov */
+    0x3800100bf903f543ULL,  /*   mov */
+    0x3800100bf903f583ULL,  /*   mov */
+    0x3800100bf903f5c3ULL,  /*   mov */
+    0x39e0400c3c03f301ULL,  /*   sub */
+    0x02ffff7dff00d000ULL,  /*   branch ANYNA */
+    0x3800100cf903f343ULL,  /*   mov */
+    0x3800000d3803f350ULL,  /*   add */
+    0x38000000bb03f000ULL,  /*   nop */
+    0x38850000bb03f000ULL,  /*   nop */
+    0x38854000bb03f000ULL,  /*   nop */
+    0x38858000bb03f000ULL,  /*   nop */
+    0x3885c000bb03f000ULL,  /*   nop */
+    0x38000018f903f343ULL,  /*   mov */
+    0x380080113c03f2c5ULL,  /*   sub */
+    0x380a0018f903f283ULL,  /*   mov */
+    0x38001020f903f3c3ULL,  /*   mov */
+    0x3800100bf903f503ULL,  /*   mov */
+    0x3800100bf903f543ULL,  /*   mov */
+    0x3800100bf903f583ULL,  /*   mov */
+    0x3800100bf903f5c3ULL,  /*   mov */
+    0x3800100cf903f603ULL,  /*   mov */
+    0x39e040063c03f181ULL,  /*   sub */
+    0x02fffe85ff00d000ULL,  /*   branch ANYNA */
+    0x38000000bb03f000ULL,  /*   nop */
+    0x38000000bb03f000ULL,  /*   nop */
+    0x38000000bb03f000ULL,  /*   nop */
+    0x38001006bb03f00fULL,  /*   tmuwt */
+    0x38201012bb03f00eULL,  /*   barrierid */
+    0x38000000bb03f000ULL,  /*   nop */
+    0x38000000bb03f000ULL,  /*   nop */
+    0x38200000bb03f000ULL,  /*   nop */
+    0x38200000bb03f000ULL,  /*   nop */
+    0x38000000bb03f000ULL,  /*   nop */
+    0x38000000bb03f000ULL,  /*   nop */
+    0x38200000bb03f000ULL,  /*   nop */
+    0x38000000bb03f000ULL,  /*   nop */
+    0x38000000bb03f000ULL,  /*   nop */
+    0x38000000bb03f000ULL,  /*   nop */
+};
+const unsigned g2d_qpu_argb_copy_n = 103;
+
+/* ============================================================
+ * 自产 2D 内核（py-videocore7 汇编器生成，真机 65536/65536 验证）
+ *
+ * 生成方式：tools/qpudis/vc7_gen.py（勿手改本段）
+ *   python3 tools/qpudis/vc7_gen.py > /tmp/k.h  然后并入本文件
+ *
+ * 与上面 EwokOS 原始 blob 的区别：
+ *   - 全部由汇编器产出，指令编码与硬件一致（nop 的 0x3186 等）
+ *   - 用 rf12/rf25 之外的普通寄存器做循环指针，避开 magic 段
+ *   - TMU 走默认字节地址模式，不写 tmuc
+ * ============================================================ */
+static const uint64_t g2d_qpu_copy_vec[] = {
+    0x398bf186bb03f000ULL,
+    0x398c3186bb03f000ULL,
+    0x398c7186bb03f000ULL,
+    0x3986b186bb03f000ULL,
+    0x39867186bb03f000ULL,
+    0x38003186bb03f000ULL,
+    0x38003186bb03f000ULL,
+    0x38003186bb03f000ULL,
+    0x38003186bb03f000ULL,
+    0x38002198bb03f001ULL,
+    0x39e021987d03f602ULL,
+    0x0c001606bb619000ULL,
+    0x380021af3803fbd8ULL,
+    0x380021b03803fc18ULL,
+    0x38002194bb03f002ULL,
+    0x39e021957c03f502ULL,
+    0x380021963803fbd5ULL,
+    0x3800318cf903f583ULL,
+    0x38003186bb03f000ULL,
+    0x38003186bb03f000ULL,
+    0x38873186bb03f000ULL,
+    0x380021973803fc15ULL,
+    0x3800318bf903f703ULL,
+    0x3800318cf903f5c3ULL,
+    0x38003186bb03f00fULL,
+    0x380021af3803fbdaULL,
+    0x380021b03803fc1aULL,
+    0x39e061b13c03fc41ULL,
+    0x02ffff73ff00d000ULL,
+    0x38003186bb03f000ULL,
+    0x38003186bb03f000ULL,
+    0x38003186bb03f000ULL,
+    0x38003186bb03f000ULL,
+    0x38203186bb03f000ULL,
+    0x38003186bb03f000ULL,
+    0x38003186bb03f000ULL,
+};
+static const unsigned g2d_qpu_copy_vec_n = 36;
+
+static const uint64_t g2d_qpu_alpha_vec[] = {
+    0x398bf186bb03f000ULL,
+    0x398c3186bb03f000ULL,
+    0x398c7186bb03f000ULL,
+    0x3986b186bb03f000ULL,
+    0x398b7186bb03f000ULL,
+    0x398b3186bb03f000ULL,
+    0x398af186bb03f000ULL,
+    0x398ab186bb03f000ULL,
+    0x398a7186bb03f000ULL,
+    0x398a3186bb03f000ULL,
+    0x3988f186bb03f000ULL,
+    0x38003186bb03f000ULL,
+    0x38003186bb03f000ULL,
+    0x38003186bb03f000ULL,
+    0x380021a2bb03f001ULL,
+    0x39e021a27d03f882ULL,
+    0x0c001886bb8a3000ULL,
+    0x380021af3803fbe2ULL,
+    0x380021b03803fc22ULL,
+    0x38002194bb03f002ULL,
+    0x39e021957c03f502ULL,
+    0x380021963803fbd5ULL,
+    0x3800318cf903f583ULL,
+    0x38003186bb03f000ULL,
+    0x38003186bb03f000ULL,
+    0x38873186bb03f000ULL,
+    0x3800219b3803fc15ULL,
+    0x3800318cf903f6c3ULL,
+    0x38003186bb03f000ULL,
+    0x38003186bb03f000ULL,
+    0x38877186bb03f000ULL,
+    0x38002190f903f743ULL,
+    0x38002190b503f42bULL,
+    0x0c001446bb42c000ULL,
+    0x38002192b503f72bULL,
+    0x0c001486bb4ad000ULL,
+    0x380021913803f452ULL,
+    0x380021917d03f46aULL,
+    0x38002190f903f443ULL,
+    0x380021937d03f76aULL,
+    0x38002193b503f4ebULL,
+    0x0c001446bb4ec000ULL,
+    0x380021927d03f72aULL,
+    0x38002192b503f4abULL,
+    0x0c001486bb4ad000ULL,
+    0x380021913803f452ULL,
+    0x380021917d03f46aULL,
+    0x380021917c03f46aULL,
+    0x38002190b603f411ULL,
+    0x380021937d03f769ULL,
+    0x38002193b503f4ebULL,
+    0x0c001446bb4ec000ULL,
+    0x380021927d03f729ULL,
+    0x38002192b503f4abULL,
+    0x0c001486bb4ad000ULL,
+    0x380021913803f452ULL,
+    0x380021917d03f46aULL,
+    0x380021917c03f469ULL,
+    0x38002190b603f411ULL,
+    0x380021937d03f768ULL,
+    0x0c001446bb4ec000ULL,
+    0x380021927d03f728ULL,
+    0x0c001486bb4ad000ULL,
+    0x380021913803f452ULL,
+    0x380021917d03f46aULL,
+    0x380021917c03f468ULL,
+    0x38002190b603f411ULL,
+    0x3800318bf903f403ULL,
+    0x3800318cf903f6c3ULL,
+    0x38003186bb03f00fULL,
+    0x380021af3803fbdaULL,
+    0x380021b03803fc1aULL,
+    0x39e061b13c03fc41ULL,
+    0x02fffe33ff00d000ULL,
+    0x38003186bb03f000ULL,
+    0x38003186bb03f000ULL,
+    0x38003186bb03f000ULL,
+    0x38003186bb03f000ULL,
+    0x38203186bb03f000ULL,
+    0x38003186bb03f000ULL,
+    0x38003186bb03f000ULL,
+};
+static const unsigned g2d_qpu_alpha_vec_n = 81;
+
 #endif /* V3D_QPU_KERNELS_H */

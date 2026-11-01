@@ -27,4 +27,18 @@ int v3d_pm_reset(v3d_dev_t* v);
 /* 解析 HUB_IDENT1/IDENT3：版本号、核数、IP 版本。 */
 void v3d_ident(v3d_dev_t* v, uint32_t* ver, uint32_t* ncores, uint32_t* iprev);
 
+/* 失效 slice cache + 整个 L2T。CSD/CL 提交前必须调（Linux 的
+ * v3d_csd_job_run 同样在写 CFG0 前调 v3d_invalidate_caches）。
+ * 不做的话 QPU 可能取到脏的指令/uniform，表现为 job 静默不执行。 */
+void v3d_invalidate_caches(v3d_dev_t* v);
+
+/* 把 L2T 里的脏行【写回 DRAM】再标记干净（Linux v3d_clean_caches /
+ * EwokOS g2d_caches_clean 的等价物，FLM_CLEAN）。
+ *
+ * 【为什么必须有】v3d_invalidate_caches 用的是 FLM_FLUSH —— 只失效、
+ * 不写回。CSD 写完的结果如果还留在 L2T 里没落 DRAM，下一次 dispatch
+ * 前的 invalidate 会把它直接丢弃，后续 job 读到的就是旧数据（全 0）。
+ * 实测表现：fill（只写）一直正常，而 copy/alpha（读源）永远读回 0。 */
+void v3d_clean_caches(v3d_dev_t* v);
+
 #endif /* V3D_HW_H */

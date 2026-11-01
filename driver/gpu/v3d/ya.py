@@ -16,5 +16,6 @@ add_files(
     'v3d_mmu.c',
     'v3d_csd.c',
     'v3d_tfu.c',
-    'v3d_g2d.c'
+    'v3d_g2d.c',
+    'v3d_mbox.c'
 )

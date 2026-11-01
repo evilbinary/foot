@@ -148,6 +148,7 @@
 #define V3D_INT_CSDDONE (1u << 6) /* 7.1 的 CSD_DONE 是 bit6 */
 #define V3D_CTL_INT_MSK_SET 0x00060u
 #define V3D_CTL_INT_MSK_CLR 0x00064u
+#define V3D_CTL_INT_MSK_STS 0x0005cu /* 当前屏蔽状态（读回确认） */
 
 /* ---- CSD（计算着色器分发，core0 窗口；V3D 7.x 偏移）----
  * 提交流程（对照 Linux drm/v3d/v3d_sched.c: v3d_csd_job_run）：
@@ -228,5 +229,45 @@
 #define V3D_PM_GRAFX_OFF 0x10cu
 #define V3D_PM_PASSWORD 0x5A000000u
 #define V3D_PM_V3DRSTN (1u << 6)
+
+/* ---------------- 缓存失效（CSD/CL 提交前必做） ----------------
+ * Linux v3d_csd_job_run() 在写 CFG0 之前调 v3d_invalidate_caches()：
+ *   v3d_flush_l2t()        → L2T 全部失效（QPU 取指令/uniform 走这里）
+ *   v3d_invalidate_slices()→ slice cache 失效（只读缓存）
+ * 不做的话，QPU 可能从 L2T/slice 里取到脏的指令或 uniform，表现为
+ * "job 收下了但什么都不写"（实测 CSD_STATUS 的 NUM_COMPLETED 不前进）。 */
+#define V3D_CTL_SLCACTL 0x00024u /* slice cache 控制 */
+#define V3D_SLCACTL_TVCCS_SHIFT 24
+#define V3D_SLCACTL_TDCCS_SHIFT 16
+#define V3D_SLCACTL_UCC_SHIFT 8
+#define V3D_SLCACTL_ICC_SHIFT 0
+
+#define V3D_CTL_SLCACTL 0x00024u
+/* per-slice 读侧缓存清除。四个 4 位字段 = "清多少个缓存行"，写 0xF 表示整块清空：
+ *   ICC   [3:0]   指令缓存
+ *   UCC   [11:8]  uniform 缓存
+ *   TDCCS [19:16] TMU 数据缓存
+ *   TVCCS [27:24] TMU varying 缓存
+ * 【为什么必须有】TMU 的读操作依赖 data/varying 缓存。不先清掉，读会挂在
+ * 等待一个永远不会到来的响应上 —— 实测：把一次已确认能成功的写入放到读
+ * 之后，写入不再发生，说明线程死在读那里（不是"读到 0"）。 */
+#define V3D_SLCACTL_CLEAR_ALL 0x0F0F0F0Fu
+
+#define V3D_CTL_L2TCACTL 0x00030u
+#define V3D_L2TCACTL_TMUWCF (1u << 8)  /* TMU 写合并缓冲排空 */
+/* L1 Cache Flush Control（packet 76）映射到 L2TCACTL 的高位段：
+ *   [15:12] TMU Config Cache Clear   ← 我们从没清过
+ *   [11:8]  TMU Data Cache Clear     ← 即 TMUWCF
+ * 若配置缓存陈旧，QPU 写 tmuc 不会生效，后续 TMU 读会沿用旧的（无效）
+ * 配置而返回 0 —— 正好是 fill（不依赖 config，正常）与 copy（依赖，全 0）
+ * 的分界。 */
+#define V3D_L2TCACTL_TMUCFCF (1u << 12) /* TMU 配置缓存清除 */
+#define V3D_L2TCACTL_FLM_FLUSH 0u     /* 失效（不写回） */
+#define V3D_L2TCACTL_FLM_CLEAN 2u     /* 写回并标干净 */
+#define V3D_L2TCACTL_FLM_SHIFT 1
+#define V3D_L2TCACTL_L2TFLS (1u << 0) /* 忙标志，写完自清 */
+
+#define V3D_CTL_L2TFLSTA 0x00034u /* 失效区间起始 */
+#define V3D_CTL_L2TFLEND 0x00038u /* 失效区间结束（含） */
 
 #endif /* V3D_REGS_H */

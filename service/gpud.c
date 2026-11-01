@@ -31,7 +31,9 @@ int main(int argc, char* argv[]) {
   (void)argc;
   (void)argv;
 
-  printf("gpud: starting\n");
+  /* 带上构建时间戳：调试期间"输出没变化"经常是因为新二进制没部署，
+   * 有了这一行，每次看第一行就能确认跑的是哪一版。 */
+  printf("gpud: starting (build %s %s)\n", __DATE__, __TIME__);
 
   const gpu_backend_t* g_be = GPU_BACKEND_DEFAULT;
 

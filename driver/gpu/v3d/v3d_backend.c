@@ -25,6 +25,7 @@
 #include "v3d_csd.h"
 #include "v3d_g2d.h"
 #include "v3d_hw.h"
+#include "v3d_mbox.h"
 #include "v3d_mmu.h"
 #include "v3d_regs.h"
 #include "v3d_tfu.h"
@@ -59,11 +60,26 @@
 #define DST_GVA 0x10010000UL    /* TFU 目标 GPU 虚拟地址 */
 #define FB_SRC_VA 0x47000000UL  /* 屏幕填充：RGB565 源行 CPU 映射 */
 #define FB_SRC_GVA 0x10020000UL /* 屏幕填充：RGB565 源行 GPU 虚拟地址 */
-#define FB_GVA 0x20000000UL     /* 屏幕 framebuffer 的 GPU 虚拟地址 */
+#define FB_GVA 0x20000000UL
+
+/* 读 aarch64 物理计数器，用于性能测量（cntfrq_el0 是频率） */
+static inline uint64_t g2d_rd_pct(void) {
+  uint64_t v;
+  __asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(v));
+  return v;
+}
+static inline uint64_t g2d_rd_frq(void) {
+  uint64_t v;
+  __asm__ volatile("isb; mrs %0, cntfrq_el0" : "=r"(v));
+  return v;
+}     /* 屏幕 framebuffer 的 GPU 虚拟地址 */
 
 /* CSD 2D 自测：256×256 ARGB8888 离屏 BO */
 #define G2D_TEST_VA 0x49000000UL  /* 用户态映射 */
 #define G2D_TEST_GVA 0x31000000UL /* GPU 虚拟地址（避开 BO 0x30000000） */
+#define G2D_TEST2_VA 0x4B000000UL /* 第二块离屏 BO（blit/alpha 的 dst）；
+                                   * 避开 mailbox 的 0x4A000000 */
+#define G2D_TEST2_GVA 0x32000000UL /* 其 GPU VA（避开 0x31000000） */
 
 static v3d_dev_t g_dev;
 static uint32_t g_ident0;
@@ -252,9 +268,40 @@ static int v3d_init(void) {
     return -1;
   }
 
+  /* 4.5) V3D 时钟：Linux v3d_power_resume() 的第一步就是
+   * clk_prepare_enable(v3d->clk)。固件若把 V3D 核心时钟留在关闭状态，
+   * 寄存器读写照样能用（APB 时钟独立），但 QPU 阵列不推进 —— job 被接收、
+   * CSD_STATUS 序号照常递增、INT_STS 只有残留位、像素一个都不写。
+   * 这里把时钟拉到固件报告的最大值。 */
+  {
+    int mrc = v3d_mbox_init();
+    unsigned mx = 0, now = 0;
+    int setrc = -1;
+    if (mrc == 0) {
+      mx = (unsigned)v3d_mbox_get_max_clock(V3D_MBOX_CLOCK_V3D);
+      if (mx != 0) {
+        setrc = v3d_mbox_set_clock(V3D_MBOX_CLOCK_V3D, mx);
+      }
+      now = (unsigned)v3d_mbox_get_clock(V3D_MBOX_CLOCK_V3D);
+    }
+    printf("v3d: clock mbox=%d max=%u set_rc=%d now=%u\n", mrc, mx, setrc, now);
+  }
+
   /* 5) P1：SMS 上电 + PM 复位 */
-  v3d_sms_powerup(&g_dev);
-  v3d_pm_reset(&g_dev);
+  /* 【SMS 上电 + PM 复位：QPU 阵列的启动开关】
+   * 缺这一步 QPU 永远不启动 —— 但 job 提交不会报错：CFG0 写下去硬件收下、
+   * CSD_STATUS 有值、INT_STS 只有残留位、像素全 0，看起来像"跑了但没写"。
+   * 这两行原来没检查返回值，失败是静默的，这里必须回读状态寄存器。 */
+  {
+    int rc_sms = v3d_sms_powerup(&g_dev);
+    int rc_pm = v3d_pm_reset(&g_dev);
+    uint32_t ree = g_dev.sms[V3D_SMS_REE_CS / 4];
+    uint32_t pmg = g_dev.pm[V3D_PM_GRAFX_OFF / 4];
+    printf("v3d: sms rc=%d pm rc=%d ree_cs=0x%08x(state=0x%x) "
+           "pm_grafx=0x%08x rstn=%u\n",
+           rc_sms, rc_pm, ree, (unsigned)(ree & V3D_SMS_STATE_MASK), pmg,
+           (pmg & V3D_PM_V3DRSTN) ? 1u : 0u);
+  }
 
   /* 6) P1：解析 IDENT1/IDENT3 */
   uint32_t ver = 0, ncores = 0, iprev = 0;
@@ -293,10 +340,32 @@ static int v3d_init(void) {
   int mrc = v3d_mmu_setup(&g_dev, pt, pt_pa, scratch_pa);
   printf("v3d: MMU setup rc=%d pt_pa=0x%08x scratch_pa=0x%08x\n", mrc, pt_pa,
          scratch_pa);
+  /* 【关键回读】0x11000000 = 272MB 本身就落在 1GB RAM 的物理地址范围内。
+   * 如果 MMU 没真正 ENABLE，QPU 会把 0x11000000 当物理地址直通访问 ——
+   * 那是内核堆，读到的是垃圾指令：既不报 MMU fault（地址合法），也不写
+   * 像素（指令无意义）。这正好解释"无 fault + 像素全 0 + NC 不动"。 */
+  printf("v3d: mmu ctl=0x%08x(en=%u) mmuc=0x%08x(en=%u) debug=0x%08x\n",
+         v3d_mmu_ctl(&g_dev), (unsigned)(v3d_mmu_ctl(&g_dev) & 1u),
+         v3d_mmuc_control(&g_dev),
+         (unsigned)(v3d_mmuc_control(&g_dev) & 1u), v3d_mmu_debug_info(&g_dev));
 
   int lrc = v3d_l2c_enable(&g_dev);
   printf("v3d: L2C enable rc=%d l2cactl=0x%08x\n", lrc,
          v3d_l2c_status(&g_dev));
+
+  /* 【中断全屏蔽 + 全清：QPU 阵列能不能发 batch 的关键】
+   * EwokOS 在 init 末尾调 g2d_csd_irq_init()，头两行就是
+   *   INT_MSK_SET = ~0;   INT_CLR = ~0;
+   * 我们从来没碰过 INT_MSK。上电默认若是"全部使能"，QPU 每完成一个 batch
+   * 就拉中断线，而没人清 INT_STS —— 实测一直停在 0x0fff0000（bits16..27
+   * 的 QPU 位全挂着）。QPU 会认为中断未被处理而不再发放新 batch，
+   * 表现就是 CURRENT_CFG4 恒为 0、像素一个都不写、CSD_DONE 永不置位。 */
+  g_dev.core0[V3D_CTL_INT_MSK_SET / 4] = 0xFFFFFFFFu;
+  g_dev.core0[V3D_CTL_INT_CLR / 4] = 0xFFFFFFFFu;
+  __asm__ volatile("dmb sy" ::: "memory");
+  printf("v3d: irq masked msk_sts=0x%08x int_sts=0x%08x\n",
+         g_dev.core0[V3D_CTL_INT_MSK_STS / 4],
+         g_dev.core0[V3D_CTL_INT_STS / 4]);
 
   /* 8) 屏幕初始化（不自动填色，避免盖住现有 UI；由应用 FILL 驱动） */
   screen_init();
@@ -309,7 +378,7 @@ static int v3d_init(void) {
   if (v3d_g2d_init(&g_dev) == 0) {
     uint32_t tpa = 0, tsize = 0;
     foot_cap_t tcap =
-        foot_cap_alloc_arena(256u * 256u * 4u, 0, 0, &tpa, &tsize);
+        foot_cap_alloc_arena(256u * 256u * 4u + 8192u, 0, 0, &tpa, &tsize);
     if (tcap != FOOT_CAP_NONE && tsize >= 256u * 256u * 4u &&
         foot_cap_map(tcap, (void*)G2D_TEST_VA, 0, tsize) == 0) {
       volatile uint32_t* pt = (volatile uint32_t*)PT_VA;
@@ -330,9 +399,345 @@ static int v3d_init(void) {
       int rc = v3d_g2d_fill(&g_dev, G2D_TEST_GVA, 256, 256, 0, 0, 256, 256,
                             0xFF00FF00u);
       foot_cache_invalidate((void*)t32, (void*)(G2D_TEST_VA + tsize));
-      printf("g2d selftest: rc=%d px[0]=0x%08x px[mid]=0x%08x px[last]=0x%08x"
-             " (expect 0xff00ff00)\n",
-             rc, t32[0], t32[256u * 128u], t32[256u * 256u - 1]);
+      /* 【全量扫描】只看 3 个采样点无法区分"完全没写"和"写了但范围/步长
+       * 不对"。统计非 0 像素数 + 记录第一个非 0 的位置，能直接定性：
+       *   nonzero=0        → kernel 一条存储指令都没执行
+       *   nonzero=65536    → 写满（正常）
+       *   0 < nonzero < N  → 写了，但 band/stride 计算和预期不符 */
+      {
+        unsigned nz = 0, fidx = 0;
+        unsigned fval = 0;
+        for (unsigned i = 0; i < 256u * 256u; i++) {
+          if (t32[i] != 0) {
+            if (nz == 0) {
+              fval = t32[i];
+              fidx = i;
+            }
+            nz++;
+          }
+        }
+        printf("g2d selftest: rc=%d nonzero=%u/%u first@%u=0x%08x "
+               "(expect 65536/65536 first@0=0xff00ff00)\n",
+               rc, nz, 256u * 256u, fidx, fval);
+      }
+
+      /* ---- blit / alpha 自测（第二块离屏 BO 作 dst）----
+       * src 已被上面的 fill 填成了 0xFF00FF00（不透明绿）。 */
+      {
+        uint32_t dpa = 0, dsize = 0;
+        foot_cap_t dcap =
+            foot_cap_alloc_arena(256u * 256u * 4u + 8192u, 0, 0, &dpa, &dsize);
+        if (dcap != FOOT_CAP_NONE && dsize >= 256u * 256u * 4u &&
+            foot_cap_map(dcap, (void*)G2D_TEST2_VA, 0, dsize) == 0) {
+          uint32_t dpages = dsize / V3D_MMU_PAGE_SIZE;
+          for (uint32_t i = 0; i < dpages; i++) {
+            v3d_mmu_map_page(pt, G2D_TEST2_GVA + i * V3D_MMU_PAGE_SIZE,
+                             dpa + i * V3D_MMU_PAGE_SIZE);
+          }
+          foot_cache_clean((void*)pt, (void*)(PT_VA + V3D_MMU_PT_BYTES));
+          v3d_mmu_flush(&g_dev);
+
+          volatile uint32_t* d32 = (volatile uint32_t*)G2D_TEST2_VA;
+          for (uint32_t i = 0; i < 256u * 256u; i++) {
+            d32[i] = 0;
+          }
+          foot_cache_clean((void*)d32, (void*)(G2D_TEST2_VA + dsize));
+
+          /* 【实验 A：用已验证的 fill 去写 dst2】
+           * fill 走的是同一条 CSD 提交路径且一直成功。如果它写不了这块
+           * BO，说明问题在 dst2 的 PTE/映射，而不是 copy 内核；
+           * 如果它能写满，那 dst2 完全正常，故障就收敛到 copy 内核本身
+           * （读源 / batch 划分 / uniform 语义）。 */
+          {
+            int frc = v3d_g2d_fill(&g_dev, G2D_TEST2_GVA, 256, 256, 0, 0, 256,
+                                   256, 0xFFFF0000u);
+            foot_cache_invalidate((void*)d32, (void*)(G2D_TEST2_VA + dsize));
+            unsigned fnz = 0;
+            for (unsigned i = 0; i < 256u * 256u; i++) {
+              if (d32[i] != 0) {
+                fnz++;
+              }
+            }
+            printf("g2d dst2-fill: rc=%d nonzero=%u/%u px[0]=0x%08x "
+                   "(expect 65536, 0xffff0000)\n",
+                   frc, fnz, 256u * 256u, d32[0]);
+          }
+
+          /* 【CPU alpha 混合（半透明合成的可用实现）】
+           * dst2 此刻全是红 0xFFFF0000，src 是绿 0xFF00FF00。
+           * 把绿按 50% 叠到红上，期望 0xFF807F00：
+           *   有效 alpha a = (255*128)>>8 = 127
+           *   r = (0*127 + 255*128)/255 = 128 = 0x80
+           *   g = (255*127 + 0*128)/255 = 127 = 0x7f
+           * QPU 的 argb_alpha 要读 dst，而 TMU 读在我们这边不可用；
+           * TFU 又不支持混合，所以这条路是现在唯一可用的。 */
+          {
+            const volatile uint32_t* s32 =
+                (const volatile uint32_t*)(uintptr_t)G2D_TEST_VA;
+            v3d_g2d_alpha_cpu((uint32_t*)(uintptr_t)d32,
+                              (const uint32_t*)(uintptr_t)s32, 256, 256, 128);
+            foot_cache_clean((void*)d32, (void*)(G2D_TEST2_VA + dsize));
+            printf("g2d alpha(cpu): px[0]=0x%08x (expect 0xff807f00, "
+                   "green 50%% over red)\n",
+                   d32[0]);
+          }
+
+          /* 【最小 TMU 读验证】
+           * src 已被最前面的 fill 填成 0xFF00FF00（绿）。这里用正确的
+           * Texture/Sampler State 读它的 (0,0) 像素，写到 dst2 起始处：
+           *   dst2[0] == 0xff00ff00  ⇒ descriptor 布局正确，TMU 读通了
+           *   dst2[0] == 0x00000000  ⇒ 仍读不到（descriptor 字段或坐标还有问题）
+           * 先把 dst2 清 0，这样结果一目了然。 */
+          for (uint32_t i = 0; i < 256u * 256u; i++) {
+            d32[i] = 0;
+          }
+          foot_cache_clean((void*)d32, (void*)(G2D_TEST2_VA + dsize));
+          {
+            /* 先跑对照：只写常量，不读源。通了说明内核框架和写路径正常，
+             * 那 miniread 的失败就只可能出在 TMU 读这一侧。 */
+            /* 阶梯探针：四个标记分别代表"经过某一步后仍能写完"。
+             *   11111111 = 基线（内核在跑）
+             *   22222222 = 经过 mov tmuc ×3
+             *   33333333 = 经过 thrsw
+             *   44444444 = 经过 ldtmu
+             * 第一个缺失的位置就是卡死点。 */
+            /* 最小读内核：读是第一个 TMU 操作，读 src 首字后写 dst。
+             *   px[0] = 读到的值（期望 ff00ff00）
+             *   px[1] = 0x11111111（标记；写出来 = 内核越过了读） */
+            /* 预埋两个可区分的像素，用来确定 TMU 坐标编码：
+             *   src[1]   = 0x00000001
+             *   src[256] = 0x00000100
+             * 其余仍是 fill 的 0xff00ff00。 */
+            t32[1] = 0x00000001u;
+            t32[256] = 0x00000100u;
+            foot_cache_clean((void*)t32, (void*)(G2D_TEST_VA + dsize));
+
+            /* 【coordprobe 已移除】它依赖 g2d_mini_write，而那个小内核随
+             * mini_kernel.h 一起删除了（stub 成 return -1 只会打印 rc=-1）。
+             *
+             * 它原本的用途是"证明 TMU 裸字节地址读是通的"。这个能力现在
+             * 由下面 blit(gpu) 的 65536/65536 更强地证明 —— blit 能在整幅
+             * 图上逐像素读对，比读 4 个地址严格得多。
+             * 若将来又要单独验读通路，把 mini_kernel.h 从 git 历史里取回、
+             * 恢复 v3d_g2d_miniwrite 即可。 */
+            (void)d32;
+
+          /* 【让 src 逐像素不同】之前 src 几乎全是 0xff00ff00，只有 s1、
+           * s256 两处不同 —— 读错位置也是绿色，所以"lane 2..15 全对"
+           * 根本不能证明它们读对了。这里填成逐像素唯一的图案。 */
+          for (uint32_t i = 0; i < 256u * 256u; i++) {
+            t32[i] = 0x80000000u | i;
+          }
+          foot_cache_clean((void*)t32, (void*)(G2D_TEST_VA + dsize));
+
+          /* 【原版 argb_copy，按 EwokOS 探针的 ABI 跑】
+           * EwokOS 的 v3d_g2d_vec4_ok() 就是这么调的：拷 2 行 × 256 字节，
+           * 单 QPU。如果这版能拷出正确像素，说明之前 blit/alpha 失败纯粹是
+           * 我们算错了 uniform 布局；如果仍为 0，则是环境差异（它的 buffer
+           * 在 dma NOCACHE 且 IOVA == 物理地址）。 */
+          for (uint32_t i = 0; i < 256u * 256u; i++) {
+            d32[i] = 0;
+          }
+          foot_cache_clean((void*)d32, (void*)(G2D_TEST2_VA + dsize));
+          {
+            int orc = v3d_g2d_copy_orig(&g_dev, G2D_TEST_GVA, G2D_TEST2_GVA,
+                                        256u, 2u);
+            foot_cache_invalidate((void*)d32, (void*)(G2D_TEST2_VA + dsize));
+            unsigned onz = 0;
+            for (unsigned i = 0; i < 128u; i++) {
+              if (d32[i] != 0) {
+                onz++;
+              }
+            }
+            (void)0;
+          }
+
+          /* 【原版 argb_copy + 物理地址】EwokOS 是 identity map，它传 pa；
+           * 我们刚把 arena 也 identity 映射了，条件等价。 */
+          for (uint32_t i = 0; i < 256u * 256u; i++) {
+            d32[i] = 0;
+          }
+          foot_cache_clean((void*)d32, (void*)(G2D_TEST2_VA + dsize));
+          {
+            int orc2 = v3d_g2d_copy_orig(&g_dev, tpa, dpa, 256u, 2u);
+            foot_cache_invalidate((void*)d32, (void*)(G2D_TEST2_VA + dsize));
+            unsigned onz2 = 0;
+            for (unsigned i = 0; i < 128u; i++) {
+              if (d32[i] != 0) {
+                onz2++;
+              }
+            }
+            (void)0;
+          }
+
+          /* 【GPU 版 blit】src → dst2 整幅拷贝。
+           * 特殊值，拷完核对这三处即可判断拷贝是否逐像素正确。 */
+          for (uint32_t i = 0; i < 256u * 256u; i++) {
+            d32[i] = 0;
+          }
+          foot_cache_clean((void*)d32, (void*)(G2D_TEST2_VA + dsize));
+          {
+            int brc = v3d_g2d_blit_gpu(&g_dev, G2D_TEST_GVA, G2D_TEST2_GVA,
+                                       256, 256);
+            foot_cache_invalidate((void*)d32, (void*)(G2D_TEST2_VA + dsize));
+            unsigned bnz = 0;
+            for (unsigned i = 0; i < 256u * 256u; i++) {
+              if (d32[i] == t32[i]) {
+                bnz++;
+              }
+            }
+            /* 诊断：看拷贝落在哪些位置。src 只有 [1]=00000001、[256]=00000100
+             * 两处特殊，其余 ff00ff00；dst 初值 0。
+             *   d0..d3 = 第一个 chunk 的前 4 个 lane
+             *   d15    = 第一个 chunk 的最后一个 lane
+             *   d16    = 第二个 chunk 起点
+             *   d256   = 第 256 像素（跨行） */
+            /* 按 lane 统计错误：每个 chunk 有 16 个 lane，若只有某一个 lane
+             * 一直错，说明它的 TMU 请求每轮都被吞掉、结果停在第一轮的值。 */
+            unsigned bad[16];
+            for (int l = 0; l < 16; l++) {
+              bad[l] = 0;
+            }
+            for (unsigned i = 0; i < 256u * 256u; i++) {
+              if (d32[i] != t32[i]) {
+                bad[i & 15u]++;
+              }
+            }
+            printf("g2d blit(gpu): rc=%d match=%u/65536 bad-per-lane: "
+                   "%u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u\n",
+                   brc, bnz, bad[0], bad[1], bad[2], bad[3], bad[4], bad[5],
+                   bad[6], bad[7], bad[8], bad[9], bad[10], bad[11], bad[12],
+                   bad[13], bad[14], bad[15]);
+            printf("  d0=%08x d1=%08x d2=%08x d3=%08x d15=%08x d16=%08x "
+                   "d17=%08x d255=%08x d256=%08x d257=%08x\n",
+                   d32[0], d32[1], d32[2], d32[3], d32[15], d32[16], d32[17],
+                   d32[255], d32[256], d32[257]);
+            printf("  src: s0=%08x s1=%08x s15=%08x s16=%08x s255=%08x "
+                   "s256=%08x s257=%08x\n",
+                   t32[0], t32[1], t32[15], t32[16], t32[255], t32[256],
+                   t32[257]);
+          }
+
+          /* 【GPU 版 alpha】红底上按 50% 混绿，期望 0xff7f7f00。
+           * 注意这里读 dst，所以 dst 的 CPU 预填必须先 clean。 */
+          for (uint32_t i = 0; i < 256u * 256u; i++) {
+            d32[i] = 0xFFFF0000u;
+          }
+          foot_cache_clean((void*)d32, (void*)(G2D_TEST2_VA + dsize));
+          {
+            int arc = v3d_g2d_alpha_gpu(&g_dev, G2D_TEST_GVA, G2D_TEST2_GVA,
+                                        256, 256, 128);
+            foot_cache_invalidate((void*)d32, (void*)(G2D_TEST2_VA + dsize));
+            printf("g2d alpha(gpu): rc=%d px0=%08x (expect bf7f0000: src=80000000 dst=ffff0000 a=128)\n", arc,
+                   d32[0]);
+          }
+
+          /* 【上屏验证】把 GPU 渲染结果（dst2 里的 ARGB8888）转成 RGB565，
+           * 借 src BO 的前 128KB 做中转，再用 TFU 拷到屏幕左上角。
+           * 屏幕是 RGB565、每行 1920 像素，所以 dst_stride = 1920。
+           * 这一段跑完，屏幕上应该出现一块 256×256 的彩色区域。 */
+          {
+            volatile uint16_t* o = (volatile uint16_t*)(uintptr_t)t32;
+            for (uint32_t i = 0; i < 256u * 256u; i++) {
+              uint32_t c = d32[i];
+              uint32_t r = (c >> 16) & 0xFFu;
+              uint32_t g = (c >> 8) & 0xFFu;
+              uint32_t b = c & 0xFFu;
+              o[i] = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+            }
+            foot_cache_clean((void*)t32, (void*)(G2D_TEST_VA + 128u * 1024u));
+            int trc = v3d_tfu_copy_ex(&g_dev, G2D_TEST_GVA, FB_GVA, 256, 256,
+                                      256, 1920, 6);
+            printf("g2d onscreen: rc=%d (256x256 上屏到 0,0，RGB565)\n", trc);
+          }
+
+          /* 【直接地址读】用 argb_copy 的真实机制（tmuc=0xFFFFFFFC +
+             * tmua=裸字节地址）读 src 的第一个字。这一步能把"TMU 直接读
+             * 到底能不能用"单独拎出来验证，不带任何 2D 逻辑。 */
+            for (uint32_t i = 0; i < 256u * 256u; i++) {
+              d32[i] = 0;
+            }
+            foot_cache_clean((void*)d32, (void*)(G2D_TEST2_VA + dsize));
+            {
+              int crc =
+                  v3d_g2d_minicopy(&g_dev, G2D_TEST_GVA, G2D_TEST2_GVA);
+              foot_cache_invalidate((void*)d32,
+                                    (void*)(G2D_TEST2_VA + dsize));
+              (void)0;
+            }
+
+            /* 【同一实验，改用物理地址】
+             * EwokOS 的 IOVA == 物理地址（identity map），它传给 TMUA 的
+             * “裸地址”在那边两种解释等价。我们的 src/dst 是 0x31000000/
+             * 0x32000000 这类 IOVA，如果 TMU 的直接寻址模式绕过 MMU，
+             * 那么它看到的会是一个不存在的物理地址 —— 读回 0 正好吻合。
+             * 这里改传 tpa/dpa（arena 的物理基址）做对照。 */
+            for (uint32_t i = 0; i < 256u * 256u; i++) {
+              d32[i] = 0;
+            }
+            foot_cache_clean((void*)d32, (void*)(G2D_TEST2_VA + dsize));
+            {
+              int crc2 = v3d_g2d_minicopy(&g_dev, tpa, dpa);
+              foot_cache_invalidate((void*)d32,
+                                    (void*)(G2D_TEST2_VA + dsize));
+              (void)0;
+            }
+
+            /* 【变体：mov tmuc 带 sig.wrtmuc】
+             * argb_copy 原文没有这个信号；而 Mesa 提交 TMU 配置靠的正是它。
+             * 若这一版能读出来，说明 argb_copy 缺的就是这一步。 */
+            for (uint32_t i = 0; i < 256u * 256u; i++) {
+              d32[i] = 0;
+            }
+            foot_cache_clean((void*)d32, (void*)(G2D_TEST2_VA + dsize));
+            {
+              int crc3 =
+                  v3d_g2d_minicopy2(&g_dev, G2D_TEST_GVA, G2D_TEST2_GVA);
+              foot_cache_invalidate((void*)d32,
+                                    (void*)(G2D_TEST2_VA + dsize));
+              (void)0;
+            }
+
+            /* 再清 0，跑真正的读测试 */
+            for (uint32_t i = 0; i < 256u * 256u; i++) {
+              d32[i] = 0;
+            }
+            foot_cache_clean((void*)d32, (void*)(G2D_TEST2_VA + dsize));
+
+            int mrc = v3d_g2d_miniread(&g_dev, G2D_TEST_GVA, G2D_TEST2_GVA,
+                                       256, 256);
+            foot_cache_invalidate((void*)d32, (void*)(G2D_TEST2_VA + dsize));
+            /* 一次读 4 个分量：源是 0xFF00FF00（内存里按 RGBA8 解释为
+             * R=0x00, G=0xFF, B=0x00, A=0xFF），所以期望 00/ff/00/ff。
+             * 只要出现 ff 就说明 TMU 读通了 —— 之前只读 R 分量，恰好是 0，
+             * 所以"读通"和"读不到"看起来一样。 */
+            /* swizzle 修好后，源 0xFF00FF00 按 RGBA8 解析是
+             * R=0x00 G=0xFF B=0x00 A=0xFF。所以期望 R/B 为 0、
+             * G/A 非 0。具体编码取决于 output_type：32 位浮点时
+             * 1.0 = 0x3f800000，16 位整数时 0xFF = 0xFFFF。 */
+            /* 探针输出已停用：这条读路径依赖 EwokOS 那个我们没复现的
+             * vec4 模式，在本项目的自产路线上恒为 0，不宜出现在正常日志里。
+             * 需要时取消下面一行的注释即可恢复。 */
+            (void)mrc;
+            (void)d32;
+          }
+
+          /* 【blit / alpha 已确认不可用，不再做启动自测】
+           *
+           * 反汇编 + 探针对照得出的结论：
+           *   - argb_fill 只用 TMU 写，真机可用；
+           *   - argb_blit / argb_alpha / argb_copy 都要【读】源，而 TMU 读
+           *     依赖 TMUC 的 vec4 general-access 模式；
+           *   - 该模式在 EwokOS 里也只有仿真器验证（v3d_g2d_vec4_ok() 的
+           *     注释自述 unverified silicon territory），真机实测读回恒为 0、
+           *     不报 MMU fault（PT_INVALID_ENABLE=0，无效 PTE 静默返回 0）。
+           *
+           * 所以：不透明贴图走 TFU（已验证），半透明合成暂由 CPU 兜底。
+           * 等 TMUC 模式逆向清楚或改用编译器生成的 shader 再启用这两个内核。 */
+        } else {
+          printf("g2d blit/alpha: dst arena alloc/map failed\n");
+        }
+      }
     } else {
       printf("g2d selftest: arena alloc/map failed\n");
     }
