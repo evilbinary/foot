@@ -30,7 +30,7 @@
 /* g2d 内核/逻辑的版本号 —— 每次改动 two_d.h 里的内核或本文件的调度逻辑就加一。
  * 启动那行会打印出来，用来确认板子上跑的是不是最新版（gpud.c 里的
  * __DATE__/__TIME__ 不可靠，因为那个文件不重编）。 */
-#define G2D_REV 67
+#define G2D_REV 68
 
 #define G2D_GVA_BASE 0x11000000UL
 #define G2D_UNIFORM_GVA (G2D_GVA_BASE + 8192UL)
@@ -122,21 +122,6 @@ int v3d_g2d_init(v3d_dev_t* v) {
   g_g2d.kernel_gva[K_FILL] = G2D_GVA_BASE + off;
   off += (uint32_t)g2d_qpu_argb_fill_n * 8;
 
-  memcpy(base + off, g2d_qpu_argb_blit, (size_t)g2d_qpu_argb_blit_n * 8);
-  g_g2d.kernel_gva[K_BLIT] = G2D_GVA_BASE + off;
-  off += (uint32_t)g2d_qpu_argb_blit_n * 8;
-
-  memcpy(base + off, g2d_qpu_argb_alpha, (size_t)g2d_qpu_argb_alpha_n * 8);
-  g_g2d.kernel_gva[K_ALPHA] = G2D_GVA_BASE + off;
-  off += (uint32_t)g2d_qpu_argb_alpha_n * 8;
-
-  /* argb_copy：专门的 1:1 拷贝内核（103 条指令，不含仿射采样）。
-   * argb_blit（220 条）要同时做"坐标计算 + 采样 + 写入"，
-   * 任一环错都表现为全 0；copy 只剩"读 + 写"，用它先验证这条路径。 */
-  memcpy(base + off, g2d_qpu_argb_copy, (size_t)g2d_qpu_argb_copy_n * 8);
-  g_g2d.kernel_gva[K_COPY] = G2D_GVA_BASE + off;
-  off += (uint32_t)g2d_qpu_argb_copy_n * 8;
-
 
 
 
@@ -213,10 +198,12 @@ int v3d_g2d_init(v3d_dev_t* v) {
    * 本身重编时才变，而我们每次都只改 v3d_g2d.c / two_d.h，所以那个时间戳
    * 永远停在第一次编译的时刻，完全反映不了实际版本（踩过）。
    * 以后改动 GPU 内核或 g2d 逻辑，记得把这个 rev 加一。 */
-  printf("g2d: ready v3 rev=%d (kernels=%u/%u/%u words, qpus=%u, "
+  /* kernels 只报实际在用的三个：EwokOS 的 fill（纯写）+ 自产的 copy/alpha。
+   * argb_blit / argb_alpha / argb_copy 已删除（读路径依赖未跑通的 vec4 模式）。 */
+  printf("g2d: ready v3 rev=%d (kernels=%u+%u/%u words, qpus=%u, "
          "pt_gva=0x%08x arena pa=0x%08x)\n",
-         G2D_REV, g2d_qpu_argb_fill_n, g2d_qpu_argb_blit_n,
-         g2d_qpu_argb_alpha_n, g_g2d.num_qpus, (unsigned)G2D_GVA_BASE, pa);
+         G2D_REV, g2d_qpu_argb_fill_n, g2d_qpu_copy_vec_n,
+         g2d_qpu_alpha_vec_n, g_g2d.num_qpus, (unsigned)G2D_GVA_BASE, pa);
   return 0;
 }
 
@@ -530,48 +517,12 @@ void v3d_g2d_alpha_cpu(uint32_t* dst, const uint32_t* src, uint32_t w,
 
 int v3d_g2d_alpha(v3d_dev_t* v, uint32_t src_gva, uint32_t dst_gva, uint32_t w,
                   uint32_t h, uint32_t alpha) {
-  if (!g_g2d.inited || src_gva == 0 || dst_gva == 0 || w == 0 || h == 0 ||
-      alpha == 0) {
-    return -1;
-  }
-  uint32_t L = (w + 15u) >> 4;
-  if (L == 0) {
-    return -3;
-  }
-  uint32_t nq = g_g2d.num_qpus;
-  if (nq > h) {
-    nq = h;
-  }
-  uint32_t rows = (h + nq - 1) / nq;
-
-  uint32_t u[24];
-  u[0] = 32768u; /* pu (Q15) */
-  u[1] = 0;      /* cu */
-  u[2] = 32768u; /* qv (Q15) */
-  u[3] = 0;      /* cv */
-  u[4] = w - 1;
-  u[5] = h - 1;
-  u[6] = w;
-  u[7] = dst_gva;
-  u[8] = src_gva;
-  u[9] = L - 1;
-  u[10] = h - 1;
-  u[11] = alpha; /* 全局 alpha */
-  u[12] = L * rows;
-  u[13] = 0;  /* x0 */
-  u[14] = w;  /* x1 */
-  u[15] = 0;  /* y0 */
-  u[16] = h;  /* y1 */
-  u[17] = 16;
-  u[18] = L * 64u - w * 4u;
-  u[19] = 255;
-  u[20] = rows;
-  u[21] = rows * w * 4u;
-  u[22] = g_g2d.scratch_gva;
-  u[23] = 0; /* full = 0 */
-
-  memcpy((void*)(uintptr_t)g_g2d.uniform_va, u, sizeof(u));
-  return g2d_dispatch(v, K_ALPHA, nq, nq, 2);
+  /* 【已停用】EwokOS argb_alpha 依赖 EwokOS 的 argb_* 原始内核，而那些 blob
+   * 已从 v3d_qpu_kernels.h 删除（它们的 TMU 读在本项目的 CSD
+   * 提交方式下恒返回 0）。自产的 copy_vec / alpha_vec 才是
+   * 实际在用的路径。保留签名只为不动调用点。 */
+  (void)v;
+  return -1;
 }
 
 
@@ -751,35 +702,12 @@ int v3d_g2d_alpha_gpu(v3d_dev_t* v, uint32_t src_gva, uint32_t dst_gva,
  */
 int v3d_g2d_copy_orig(v3d_dev_t* v, uint32_t src_gva, uint32_t dst_gva,
                       uint32_t span_bytes, uint32_t rows) {
-  if (!g_g2d.inited || src_gva == 0 || dst_gva == 0) {
-    return -1;
-  }
-  uint32_t u[11];
-  u[0] = dst_gva;                                  /* dst  */
-  u[1] = src_gva;                                  /* src  */
-  u[2] = span_bytes;                               /* dstride */
-  u[3] = span_bytes;                               /* sstride */
-  u[4] = 0u;                                       /* C = 0：单尾块 */
-  u[5] = span_bytes;                               /* V16 = 每行字节数 */
-  u[6] = rows;                                     /* H */
-  u[7] = rows;                                     /* rpq */
-  u[8] = span_bytes;                               /* drows */
-  u[9] = span_bytes;                               /* srows */
-  u[10] = g_g2d.scratch_gva;                       /* 尾部追加的 scratch */
-
-  {
-    volatile uint32_t* up = (volatile uint32_t*)(uintptr_t)g_g2d.uniform_va;
-    for (int i = 0; i < 16; i++) {
-      up[i] = 0;
-    }
-  }
-  memcpy((void*)(uintptr_t)g_g2d.uniform_va, u, sizeof(u));
-
-  v->hub[V3D_MMU_VIO_ID / 4] = 0;
-  v->hub[V3D_MMU_VIO_ADDR / 4] = 0;
-  __asm__ volatile("dmb sy" ::: "memory");
-
-  return g2d_dispatch(v, K_COPY, 1, 1, 2);
+  /* 【已停用】EwokOS argb_copy 依赖 EwokOS 的 argb_* 原始内核，而那些 blob
+   * 已从 v3d_qpu_kernels.h 删除（它们的 TMU 读在本项目的 CSD
+   * 提交方式下恒返回 0）。自产的 copy_vec / alpha_vec 才是
+   * 实际在用的路径。保留签名只为不动调用点。 */
+  (void)v;
+  return -1;
 }
 
 int v3d_g2d_miniwrite(v3d_dev_t* v, uint32_t src_gva, uint32_t dst_gva,
