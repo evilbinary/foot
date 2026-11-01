@@ -30,7 +30,7 @@
 /* g2d 内核/逻辑的版本号 —— 每次改动 two_d.h 里的内核或本文件的调度逻辑就加一。
  * 启动那行会打印出来，用来确认板子上跑的是不是最新版（gpud.c 里的
  * __DATE__/__TIME__ 不可靠，因为那个文件不重编）。 */
-#define G2D_REV 89
+#define G2D_REV 90
 
 #define G2D_GVA_BASE 0x11000000UL
 #define G2D_UNIFORM_GVA (G2D_GVA_BASE + 8192UL)
@@ -601,8 +601,8 @@ int v3d_g2d_blit_gpu(v3d_dev_t* v, uint32_t src_gva, uint32_t dst_gva,
     return -1;
   }
   /* 转换内核每 lane 处理 2 个源像素：一轮 16 lane × 2 = 32 像素 */
-  uint32_t chunks = (w * h) / 32u;
-  if (chunks == 0 || (w * h) % 32u != 0) {
+  uint32_t chunks = (w * h) / 16u;
+  if (chunks == 0 || (w * h) % 16u != 0) {
     return -2;
   }
 
@@ -628,7 +628,7 @@ int v3d_g2d_blit_gpu(v3d_dev_t* v, uint32_t src_gva, uint32_t dst_gva,
    * 所以 BO 多分配了 8KB（见 self-test 里的 alloc 调用）。 */
   uint32_t nq = g_g2d.num_qpus ? g_g2d.num_qpus : 1u;
   uint32_t rounds = (chunks + nq - 1u) / nq;
-  uint32_t qpu_stride = rounds * 128u; /* 每轮源推进 128 字节 */
+  uint32_t qpu_stride = rounds * 64u;
 
   uint32_t u[5];
   u[0] = src_gva;
