@@ -15,5 +15,6 @@ add_files(
     'v3d_hw.c',
     'v3d_mmu.c',
     'v3d_csd.c',
-    'v3d_tfu.c'
+    'v3d_tfu.c',
+    'v3d_g2d.c'
 )

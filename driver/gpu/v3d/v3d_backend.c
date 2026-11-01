@@ -23,6 +23,7 @@
 #include "gpu_backend.h"
 #include "v3d_backend.h"
 #include "v3d_csd.h"
+#include "v3d_g2d.h"
 #include "v3d_hw.h"
 #include "v3d_mmu.h"
 #include "v3d_regs.h"
@@ -59,6 +60,10 @@
 #define FB_SRC_VA 0x47000000UL  /* 屏幕填充：RGB565 源行 CPU 映射 */
 #define FB_SRC_GVA 0x10020000UL /* 屏幕填充：RGB565 源行 GPU 虚拟地址 */
 #define FB_GVA 0x20000000UL     /* 屏幕 framebuffer 的 GPU 虚拟地址 */
+
+/* CSD 2D 自测：256×256 ARGB8888 离屏 BO */
+#define G2D_TEST_VA 0x49000000UL  /* 用户态映射 */
+#define G2D_TEST_GVA 0x31000000UL /* GPU 虚拟地址（避开 BO 0x30000000） */
 
 static v3d_dev_t g_dev;
 static uint32_t g_ident0;
@@ -297,6 +302,41 @@ static int v3d_init(void) {
   screen_init();
 
   printf("v3d: backend ready (ver=%u ncores=%u)\n", ver, ncores);
+
+  /* ---- CSD 2D 自测（离屏 ARGB8888，不碰屏幕）----
+   * 目的：验证 QPU 2D 内核能跑、uniform 传参正确。屏幕是 16bpp，
+   * 上屏要另做格式转换，所以这里只在离屏 BO 上验证。 */
+  if (v3d_g2d_init(&g_dev) == 0) {
+    uint32_t tpa = 0, tsize = 0;
+    foot_cap_t tcap =
+        foot_cap_alloc_arena(256u * 256u * 4u, 0, 0, &tpa, &tsize);
+    if (tcap != FOOT_CAP_NONE && tsize >= 256u * 256u * 4u &&
+        foot_cap_map(tcap, (void*)G2D_TEST_VA, 0, tsize) == 0) {
+      volatile uint32_t* pt = (volatile uint32_t*)PT_VA;
+      uint32_t tpages = tsize / V3D_MMU_PAGE_SIZE;
+      for (uint32_t i = 0; i < tpages; i++) {
+        v3d_mmu_map_page(pt, G2D_TEST_GVA + i * V3D_MMU_PAGE_SIZE,
+                         tpa + i * V3D_MMU_PAGE_SIZE);
+      }
+      foot_cache_clean((void*)pt, (void*)(PT_VA + V3D_MMU_PT_BYTES));
+      v3d_mmu_flush(&g_dev);
+
+      volatile uint32_t* t32 = (volatile uint32_t*)G2D_TEST_VA;
+      for (uint32_t i = 0; i < 256u * 256u; i++) {
+        t32[i] = 0;
+      }
+      foot_cache_clean((void*)t32, (void*)(G2D_TEST_VA + tsize));
+
+      int rc = v3d_g2d_fill(&g_dev, G2D_TEST_GVA, 256, 256, 0, 0, 256, 256,
+                            0xFF00FF00u);
+      foot_cache_invalidate((void*)t32, (void*)(G2D_TEST_VA + tsize));
+      printf("g2d selftest: rc=%d px[0]=0x%08x px[mid]=0x%08x px[last]=0x%08x"
+             " (expect 0xff00ff00)\n",
+             rc, t32[0], t32[256u * 128u], t32[256u * 256u - 1]);
+    } else {
+      printf("g2d selftest: arena alloc/map failed\n");
+    }
+  }
   return 0;
 }
 
