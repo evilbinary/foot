@@ -62,6 +62,17 @@
 #define FB_SRC_GVA 0x10020000UL /* 屏幕填充：RGB565 源行 GPU 虚拟地址 */
 #define FB_GVA 0x20000000UL
 
+/* 【启动自测开关】设为 1 时 gpud 启动后会在离屏 BO 上跑一整套 2D 验证。
+ *
+ * 默认 0：这些验证已经搬进 app/test/test-gpu.c（走 client_call 的端到端
+ * 路径，才是真实用法）。留在 gpud 里有两个问题：
+ *   1. 它和 test-gpu 抢同一个 GPU —— 实测两边交错，blit 前 16 个像素被
+ *      对方覆盖（d0=0 而 d16 正确），PRESENT 还会 foot wait timeout；
+ *   2. 每次起 gpud 都要多花几十毫秒。
+ * v3d_g2d_init() 本身始终会调用（它负责加载内核与 arena），只是验证代码
+ * 被这个开关包住了。 */
+#define G2D_SELFTEST 0
+
 /* 前置声明：自测代码里要调用这些后面才定义的 static 函数 */
 static int v3d_bo_create(void* args);
 static int v3d_bo_destroy(void* args);
@@ -381,6 +392,7 @@ static int v3d_init(void) {
    * 目的：验证 QPU 2D 内核能跑、uniform 传参正确。屏幕是 16bpp，
    * 上屏要另做格式转换，所以这里只在离屏 BO 上验证。 */
   if (v3d_g2d_init(&g_dev) == 0) {
+#if G2D_SELFTEST
     uint32_t tpa = 0, tsize = 0;
     foot_cap_t tcap =
         foot_cap_alloc_arena(256u * 256u * 4u + 8192u, 0, 0, &tpa, &tsize);
@@ -773,6 +785,7 @@ static int v3d_init(void) {
     } else {
       printf("g2d selftest: arena alloc/map failed\n");
     }
+#endif /* G2D_SELFTEST */
   }
   return 0;
 }

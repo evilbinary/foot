@@ -30,7 +30,7 @@
 /* g2d 内核/逻辑的版本号 —— 每次改动 two_d.h 里的内核或本文件的调度逻辑就加一。
  * 启动那行会打印出来，用来确认板子上跑的是不是最新版（gpud.c 里的
  * __DATE__/__TIME__ 不可靠，因为那个文件不重编）。 */
-#define G2D_REV 72
+#define G2D_REV 74
 
 #define G2D_GVA_BASE 0x11000000UL
 #define G2D_UNIFORM_GVA (G2D_GVA_BASE + 8192UL)
@@ -774,6 +774,12 @@ int v3d_g2d_present_gpu(v3d_dev_t* v, uint32_t src_gva, uint32_t dst_gva,
   }
   memcpy((void*)(uintptr_t)g_g2d.uniform_va, u, sizeof(u));
 
-  return g2d_dispatch(v, K_PRESENTV, g_g2d.num_qpus, 1, 1);
+  /* 【只启动 1 个 QPU】present 内核没有 tidx 分段（不像 copy_vec 那样用
+   * tidx>>2 各自认领一段），它是一条线性扫全图的程序。启动 12 个 QPU 时
+   * 12 个实例会同时从 src 开头处理、互相覆盖，还会抢同一个 TMU 请求队列
+   * —— 实测表现为服务调用超时（client 侧 "foot wait: timeout"），
+   * 因为 GPU 那边的 CSD 迟迟不退役。
+   * 这里固定 nq=1。若以后要提速，应当像 copy_vec 那样先加 tidx 分段。 */
+  return g2d_dispatch(v, K_PRESENTV, 1, 1, 1);
 }
 
