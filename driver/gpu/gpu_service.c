@@ -36,18 +36,20 @@ static void* gpu_service_fn(void* fn, void* args) {
       return (void*)(long)(g_be->sync ? g_be->sync(args) : 0);
 
     /* 低层（阶段 2+，为 Mesa 准备） */
+    case GPU_LOW_GET_BO_OFFSET:
+      return (void*)(long)(g_be->bo_offset ? g_be->bo_offset(args) : -1);
     case GPU_LOW_BO_CREATE:
       return (void*)(long)(g_be->bo_create ? g_be->bo_create(args) : -1);
     case GPU_LOW_BO_MMAP:
       return (void*)(long)(g_be->bo_mmap ? g_be->bo_mmap(args) : -1);
     case GPU_LOW_BO_DESTROY:
       return (void*)(long)(g_be->bo_destroy ? g_be->bo_destroy(args) : -1);
+    case GPU_LOW_SUBMIT_TFU:
+      return (void*)(long)(g_be->submit_tfu ? g_be->submit_tfu(args) : -1);
     case GPU_LOW_SUBMIT_CL:
       return (void*)(long)(g_be->submit_cl ? g_be->submit_cl(args) : -1);
     case GPU_LOW_SUBMIT_CSD:
       return (void*)(long)(g_be->submit_csd ? g_be->submit_csd(args) : -1);
-    case GPU_LOW_SUBMIT_TFU:
-      return (void*)(long)(g_be->submit_tfu ? g_be->submit_tfu(args) : -1);
     case GPU_LOW_WAIT_BO:
       return (void*)(long)(g_be->wait_bo ? g_be->wait_bo(args) : -1);
 

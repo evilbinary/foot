@@ -41,6 +41,43 @@ enum gpu_fn_low {
   GPU_LOW_WAIT_BO = 130,
 };
 
+/* ---- BO（GPU 内存对象）----
+ * 【模型】buffer 由应用/Mesa 自己分配（foot_cap_alloc_frame 拿 pa），
+ * 通过 BO_IMPORT 交给 gpud：gpud 把 pa 逐页映射进 GPU VA 空间、记录句柄。
+ * 这样 CPU 映射始终在应用侧（应用不需要把 VA 跨进程传），gpud 只管
+ * "GPU 侧地址"。
+ *
+ *   args = gpu_bo_import_req{pa, size, flags}  → 返回值 = handle（>0）
+ *   args = gpu_bo_ref{handle}                   → 返回值 = GPU VA（offset）
+ *   args = gpu_bo_ref{handle}                   → 返回值 = 0（释放）
+ */
+typedef struct {
+  unsigned int pa;    /* 物理地址（页对齐） */
+  unsigned int size;  /* 字节数（页对齐） */
+  unsigned int flags; /* GPU_BO_* */
+} gpu_bo_import_req;
+
+typedef struct {
+  unsigned int handle;
+} gpu_bo_ref;
+
+#define GPU_BO_SCANOUT (1u << 0) /* 显示输出 */
+#define GPU_BO_CACHED (1u << 1)  /* CPU 频繁读写 */
+#define GPU_BO_GPU_ONLY (1u << 2)
+
+/* ---- SUBMIT_TFU：按 BO 句柄做拷贝/填充（后端用 TFU 实现）----
+ * handle=0 表示屏幕；offset 是【字节偏移】（屏幕 = y*pitch + x*cpp）。
+ * src 和 dst 必须是【同一像素格式】（TFU 不做格式转换），tex 取 dst 的格式。 */
+typedef struct {
+  unsigned int src_handle, src_offset;
+  unsigned int dst_handle, dst_offset;
+  unsigned int w, h;
+  unsigned int src_fmt, dst_fmt; /* GPU_FMT_*（0 = 按屏幕/后端默认） */
+  unsigned int flags;            /* GPU_SUBMIT_ASYNC */
+} gpu_submit_tfu_req;
+
+#define GPU_SUBMIT_ASYNC (1u << 0)
+
 /* ---------------- 后端标识 ---------------- */
 #define GPU_BACKEND_NONE 0
 #define GPU_BACKEND_V3D 1
@@ -102,9 +139,10 @@ typedef struct gpu_backend {
   int (*sync)(void* args); /* 等 GPU 空闲 */
 
   /* 低层：不支持则置 NULL */
-  int (*bo_create)(void* args);
-  int (*bo_mmap)(void* args);
+  int (*bo_create)(void* args); /* 导入已有 pa，返回 handle */
+  int (*bo_mmap)(void* args);   /* 未用（CPU 映射在应用侧） */
   int (*bo_destroy)(void* args);
+  int (*bo_offset)(void* args); /* handle → GPU VA */
   int (*submit_cl)(void* args);
   int (*submit_csd)(void* args);
   int (*submit_tfu)(void* args);

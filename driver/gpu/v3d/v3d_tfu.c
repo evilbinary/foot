@@ -72,9 +72,10 @@ int v3d_tfu_fill_ex(v3d_dev_t* v, uint32_t src_gva, uint32_t dst_gva,
   return -2;
 }
 
-int v3d_tfu_copy(v3d_dev_t* v, uint32_t src_gva, uint32_t dst_gva,
-                 uint32_t width, uint32_t height, uint32_t src_stride_pixels,
-                 uint32_t dst_stride_pixels) {
+int v3d_tfu_copy_ex(v3d_dev_t* v, uint32_t src_gva, uint32_t dst_gva,
+                    uint32_t width, uint32_t height,
+                    uint32_t src_stride_pixels, uint32_t dst_stride_pixels,
+                    uint32_t tex_type) {
   if (v == NULL || v->hub == NULL || width == 0 || height == 0) {
     return -1;
   }
@@ -98,8 +99,7 @@ int v3d_tfu_copy(v3d_dev_t* v, uint32_t src_gva, uint32_t dst_gva,
 
   wr32(hub + V3D_TFU_ICFG / 4,
        (V3D_TFU_ICFG_FORMAT_RASTER << V3D_TFU_ICFG_IFORMAT_SHIFT) |
-           (V3D_TEX_FORMAT_RGBA8UI << V3D_TFU_ICFG_OTYPE_SHIFT) |
-           V3D_TFU_ICFG_IOC);
+           (tex_type << V3D_TFU_ICFG_OTYPE_SHIFT) | V3D_TFU_ICFG_IOC);
 
   for (int i = 0; i < 1000; i++) {
     if (!(rd32(hub + V3D_TFU_CS / 4) & V3D_TFU_CS_BUSY)) {
@@ -108,6 +108,13 @@ int v3d_tfu_copy(v3d_dev_t* v, uint32_t src_gva, uint32_t dst_gva,
     usleep(1000);
   }
   return -2;
+}
+
+int v3d_tfu_copy(v3d_dev_t* v, uint32_t src_gva, uint32_t dst_gva,
+                 uint32_t width, uint32_t height, uint32_t src_stride_pixels,
+                 uint32_t dst_stride_pixels) {
+  return v3d_tfu_copy_ex(v, src_gva, dst_gva, width, height, src_stride_pixels,
+                         dst_stride_pixels, V3D_TEX_FORMAT_RGBA8UI);
 }
 
 int v3d_tfu_fill(v3d_dev_t* v, uint32_t src_gva, uint32_t dst_gva,

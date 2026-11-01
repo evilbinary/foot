@@ -29,6 +29,13 @@ int v3d_tfu_copy(v3d_dev_t* v, uint32_t src_gva, uint32_t dst_gva,
                  uint32_t width, uint32_t height, uint32_t src_stride_pixels,
                  uint32_t dst_stride_pixels);
 
+/* 带像素格式的 raster→raster 拷贝（tex_type = Texture Data Format，
+ * 源/目标同格式；如 RGB565=6、RGBA8UI=101）。 */
+int v3d_tfu_copy_ex(v3d_dev_t* v, uint32_t src_gva, uint32_t dst_gva,
+                    uint32_t width, uint32_t height,
+                    uint32_t src_stride_pixels, uint32_t dst_stride_pixels,
+                    uint32_t tex_type);
+
 /* 读 TFU 控制/状态寄存器。 */
 uint32_t v3d_tfu_status(v3d_dev_t* v);
 

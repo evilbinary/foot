@@ -320,6 +320,147 @@ static int v3d_fill(void* args) {
   return screen_fill(r->x, r->y, r->w, r->h, r->color);
 }
 
+/* ================== 低层：BO 管理 ==================
+ * buffer 由应用/Mesa 自己分配（foot_cap_alloc_frame 拿 pa），BO_CREATE 把它
+ * 逐页映射进 GPU VA 空间并返回句柄；BO_OFFSET 拿 GPU VA（命令流里拼地址）；
+ * BO_DESTROY 清页表项。CPU 映射始终在应用侧，gpud 只管 GPU 侧。 */
+#define V3D_MAX_BOS 32
+#define V3D_BO_GVA_BASE 0x30000000UL /* 应用 buffer 区（避开屏幕/shader 区） */
+
+static struct {
+  uint32_t gva;
+  uint32_t pa;
+  uint32_t size;
+  int in_use;
+} g_bos[V3D_MAX_BOS];
+static uint32_t g_bo_next_gva = V3D_BO_GVA_BASE;
+
+static int v3d_bo_create(void* args) {
+  gpu_bo_import_req* r = (gpu_bo_import_req*)args;
+  if (r == NULL || r->pa == 0 || r->size == 0) {
+    return -1;
+  }
+  if ((r->pa & 0xFFFu) || (r->size & 0xFFFu)) {
+    return -2; /* 必须页对齐 */
+  }
+  int slot = -1;
+  for (int i = 0; i < V3D_MAX_BOS; i++) {
+    if (!g_bos[i].in_use) {
+      slot = i;
+      break;
+    }
+  }
+  if (slot < 0) {
+    return -3; /* 句柄耗尽 */
+  }
+
+  uint32_t gva = g_bo_next_gva;
+  g_bo_next_gva += r->size;
+  if (g_bo_next_gva > 0x40000000UL) {
+    return -4; /* GPU VA 区耗尽（0x30000000-0x40000000 共 256MB） */
+  }
+
+  volatile uint32_t* pt = (volatile uint32_t*)PT_VA;
+  uint32_t pages = r->size / V3D_MMU_PAGE_SIZE;
+  for (uint32_t i = 0; i < pages; i++) {
+    v3d_mmu_map_page(pt, gva + i * V3D_MMU_PAGE_SIZE,
+                     r->pa + i * V3D_MMU_PAGE_SIZE);
+  }
+  foot_cache_clean((void*)pt, (void*)(PT_VA + V3D_MMU_PT_BYTES));
+  v3d_mmu_flush(&g_dev);
+
+  g_bos[slot].gva = gva;
+  g_bos[slot].pa = r->pa;
+  g_bos[slot].size = r->size;
+  g_bos[slot].in_use = 1;
+  return slot + 1; /* handle = slot+1（0 保留为"无"） */
+}
+
+static int v3d_bo_offset(void* args) {
+  gpu_bo_ref* r = (gpu_bo_ref*)args;
+  if (r == NULL || r->handle == 0 || r->handle > V3D_MAX_BOS) {
+    return -1;
+  }
+  if (!g_bos[r->handle - 1].in_use) {
+    return -2;
+  }
+  return (int)g_bos[r->handle - 1].gva;
+}
+
+static int v3d_bo_destroy(void* args) {
+  gpu_bo_ref* r = (gpu_bo_ref*)args;
+  if (r == NULL || r->handle == 0 || r->handle > V3D_MAX_BOS) {
+    return -1;
+  }
+  int slot = r->handle - 1;
+  if (!g_bos[slot].in_use) {
+    return -2;
+  }
+  /* 清页表项（VA 段不回收，bump 分配；进程生命周期内够用） */
+  volatile uint32_t* pt = (volatile uint32_t*)PT_VA;
+  uint32_t pages = g_bos[slot].size / V3D_MMU_PAGE_SIZE;
+  for (uint32_t i = 0; i < pages; i++) {
+    v3d_mmu_map_page(pt, g_bos[slot].gva + i * V3D_MMU_PAGE_SIZE, 0);
+  }
+  foot_cache_clean((void*)pt, (void*)(PT_VA + V3D_MMU_PT_BYTES));
+  v3d_mmu_flush(&g_dev);
+
+  g_bos[slot].in_use = 0;
+  return 0;
+}
+
+/* 按 BO 句柄提交 TFU 拷贝（src/dst 同格式，tex 取 dst）。
+ * handle=0 表示屏幕；offset 是字节偏移（屏幕 = y*pitch + x*cpp）。 */
+static int v3d_submit_tfu(void* args) {
+  gpu_submit_tfu_req* r = (gpu_submit_tfu_req*)args;
+  if (r == NULL || r->w == 0 || r->h == 0) {
+    return -1;
+  }
+
+  uint32_t src_gva = 0, dst_gva = 0;
+  uint32_t src_stride = 0, dst_stride = 0;
+  uint32_t tex = 0;
+
+  /* ---- 源 ---- */
+  if (r->src_handle == 0) {
+    if (!g_screen.inited) {
+      return -2;
+    }
+    src_gva = FB_GVA + r->src_offset;
+    src_stride = g_screen.pitch / g_screen.cpp;
+  } else {
+    int i = (int)r->src_handle - 1;
+    if (i < 0 || i >= V3D_MAX_BOS || !g_bos[i].in_use) {
+      return -2;
+    }
+    src_gva = g_bos[i].gva + r->src_offset;
+    src_stride = r->w; /* 紧凑：每行 w 像素 */
+  }
+
+  /* ---- 目标 ---- */
+  if (r->dst_handle == 0) {
+    if (!g_screen.inited) {
+      return -2;
+    }
+    dst_gva = FB_GVA + r->dst_offset;
+    dst_stride = g_screen.pitch / g_screen.cpp;
+    tex = g_screen.tex;
+  } else {
+    int i = (int)r->dst_handle - 1;
+    if (i < 0 || i >= V3D_MAX_BOS || !g_bos[i].in_use) {
+      return -2;
+    }
+    dst_gva = g_bos[i].gva + r->dst_offset;
+    dst_stride = r->w;
+    tex = (r->dst_fmt == GPU_FMT_RGB565) ? V3D_TEX_FORMAT_RGB565 : 4;
+  }
+
+  /* TFU 是异步 DMA，copy_ex 内部已轮询 BUSY 到 0（同步语义）。
+   * GPU_SUBMIT_ASYNC 留给以后做 fence；当前实现仍同步返回。 */
+  return v3d_tfu_copy_ex(&g_dev, src_gva, dst_gva, r->w, r->h, src_stride,
+                         dst_stride, tex);
+}
+
 static int v3d_blit(void* args) {
   (void)args;
   /* TODO：阶段 2 用 TFU copy（src_stride != 0）实现 */
@@ -343,12 +484,13 @@ const gpu_backend_t v3d_backend = {
     .fill = v3d_fill,
     .blit = v3d_blit,
     .sync = v3d_sync,
-    /* 低层（阶段 2+ 再填） */
-    .bo_create = NULL,
-    .bo_mmap = NULL,
-    .bo_destroy = NULL,
+    /* 低层：BO 管理已实现；SUBMIT_CL/CSD 随阶段推进补 */
+    .bo_create = v3d_bo_create,
+    .bo_mmap = NULL, /* CPU 映射在应用侧（foot_cap_alloc_frame） */
+    .bo_destroy = v3d_bo_destroy,
+    .bo_offset = v3d_bo_offset,
     .submit_cl = NULL,
     .submit_csd = NULL,
-    .submit_tfu = NULL,
+    .submit_tfu = v3d_submit_tfu,
     .wait_bo = NULL,
 };
