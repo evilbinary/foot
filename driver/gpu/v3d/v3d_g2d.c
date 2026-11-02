@@ -20,6 +20,7 @@
 #include "client.h"
 #include "v3d_csd.h"
 #include "v3d_g2d.h"
+#include "v3d_3d_compat.h"
 #include "v3d_tfu.h"
 #include "v3d_hw.h"
 #include "v3d_mmu.h"
@@ -102,6 +103,9 @@ static struct {
 } g_g2d;
 
 int v3d_g2d_num_qpus(void) { return (int)g_g2d.num_qpus; }
+
+/* 3D 后端绑定（定义在文件末尾） */
+static void g2d_3d_bind(v3d_dev_t* v, volatile uint32_t* pt);
 
 int v3d_g2d_init(v3d_dev_t* v) {
   if (v == NULL || v->hub == NULL || v->core0 == NULL) {
@@ -206,6 +210,8 @@ int v3d_g2d_init(v3d_dev_t* v) {
   /* kernel blob 内容已回读验证过（首条指令 0x39800000bb03f000） */
 
   g_g2d.inited = 1;
+  /* 把 v 和页表指针交给 3D 后端（定义在文件末尾） */
+  g2d_3d_bind(v, pt);
   /* 版本标记：改过 CSD 参数/缓存维护后靠这行一眼确认跑的是新二进制
    * （v3 = cfg Y/Z 各 1 + 提交前 L2T/slice 失效）。 */
   /* 【版本号】必须放在本文件里：gpud.c 里的 __DATE__/__TIME__ 只有在 gpud.c
@@ -811,3 +817,268 @@ int v3d_g2d_present_gpu(v3d_dev_t* v, uint32_t src_gva, uint32_t w,
   return rc;
 }
 
+
+/* ================== 3D 后端所需接口（v3d_3d_min.c 调用） ==================
+ *
+ * 3D 后端假设「dma_alloc 返回物理地址，低 32 位即 GPU IOVA」（identity 映射）。
+ * 这里就按这个假设建一块 DMA arena：物理连续 + 页表里 gva == pa。
+ * 这样 3D 后端的主体逻辑一行都不用改。
+ */
+static v3d_dev_t* g_v3d = NULL;
+static volatile uint32_t* g_pt = NULL;
+
+#define DMA_ARENA_BYTES (768u * 1024u) /* CL 64K + pool 256K + tsda 64K + 余量 */
+
+static struct {
+  int inited;
+  uint32_t pa;
+  uint32_t size;
+  uint32_t used;
+  void* va;
+} g_dma;
+
+/* 【三方映射】identity 模型（VA=IOVA=PA）在 EwokOS 用户态不成立——
+ * GPU 读 arena 读到的是旧值（readback diff=8/16, d0=0），CT 取指
+ * 「取 1 字节停」正是它的表现。改用与 g2d arena 相同的模式：
+ *   CPU 侧  V3D_DMA_VA       （foot_cap_map 出来的可用 VA）
+ *   GPU 侧  V3D_DMA_GVA_BASE （页表映射到 pa）
+ *   物理    pa
+ * v3d_dma_alloc 返回 GPU VA（= 3D 后端的 IOVA），CPU 用 v3d_dma_cpu 换算。 */
+#define V3D_DMA_VA 0x4A000000UL       /* CPU 映射区（未占用） */
+#define V3D_DMA_GVA_BASE 0x4B000000UL /* GPU VA（与 G2D_GVA_BASE 不重叠） */
+
+void* v3d_dma_cpu(uint32_t iova) {
+  return (void*)(uintptr_t)(V3D_DMA_VA + (iova - V3D_DMA_GVA_BASE));
+}
+
+int v3d_g2d_ready(void) { return g_g2d.inited; }
+
+volatile uint32_t* v3d_g2d_hub_regs(void) { return g_v3d ? g_v3d->hub : NULL; }
+
+volatile uint32_t* v3d_g2d_core_regs(void) {
+  return g_v3d ? g_v3d->core0 : NULL;
+}
+
+/* CSD 引擎只有一个，3D 与 2D 的提交必须互斥 */
+static volatile int g_op_busy = 0;
+
+void v3d_g2d_op_begin(void) {
+  while (__atomic_test_and_set(&g_op_busy, __ATOMIC_ACQUIRE)) {
+    __asm__ volatile("yield");
+  }
+}
+
+void v3d_g2d_op_end(void) { __atomic_clear(&g_op_busy, __ATOMIC_RELEASE); }
+
+unsigned v3d_g2d_num_slices(void) { return 4u; }
+
+/* 地址合法性：g2d arena、dma arena、屏幕 framebuffer 都算 */
+int v3d_g2d_phy_valid(uint32_t iova, size_t len) {
+  if (iova == 0 || len == 0) {
+    return 0;
+  }
+  if (iova >= G2D_GVA_BASE &&
+      (uint64_t)iova + len <= (uint64_t)G2D_GVA_BASE + G2D_TOTAL_BYTES) {
+    return 1;
+  }
+  if (g_dma.inited && iova >= g_dma.pa &&
+      (uint64_t)iova + len <= (uint64_t)g_dma.pa + g_dma.size) {
+    return 1;
+  }
+  /* 屏幕 framebuffer：backend 把它映射在 FB_GVA（0x20000000）起的 4MB */
+  if (iova >= 0x20000000u &&
+      (uint64_t)iova + len <= (uint64_t)0x20000000u + 4u * 1024u * 1024u) {
+    return 1;
+  }
+  return 0;
+}
+
+void v3d_g2d_invalidate_span(uint32_t iova, size_t len) {
+  if (iova == 0 || len == 0) {
+    return;
+  }
+  /* identity arena 的 VA == PA */
+  foot_cache_invalidate((void*)(uintptr_t)iova, (void*)(uintptr_t)(iova + len));
+}
+
+int v3d_g2d_wedged(void) { return 0; }
+
+void v3d_g2d_recover(const char* why) { (void)why; }
+
+/* 没有可靠的 MMU 故障解码；四个输出都清零表示"无故障"，
+ * 3D 后端只把它们打进超时日志。 */
+int v3d_g2d_mmu_fault_peek(uint32_t* mctl, uint32_t* mvio, uint32_t* mid,
+                           uint32_t* mint) {
+  if (mctl) *mctl = 0;
+  if (mvio) *mvio = 0;
+  if (mid) *mid = 0;
+  if (mint) *mint = 0;
+  return 0;
+}
+
+/* ---- DMA arena（identity 映射） ---- */
+static int dma_arena_init(void) {
+  if (g_dma.inited) {
+    return 0;
+  }
+  if (g_pt == NULL) {
+    return -1;
+  }
+  uint32_t pa = 0, size = 0;
+  foot_cap_t cap = foot_cap_alloc_arena(DMA_ARENA_BYTES, 0, 0, &pa, &size);
+  if (cap == FOOT_CAP_NONE || size < DMA_ARENA_BYTES) {
+    printf("v3d_3d: dma arena alloc failed\n");
+    return -1;
+  }
+  if (foot_cap_map(cap, (void*)V3D_DMA_VA, 0, size) != 0) {
+    printf("v3d_3d: dma arena map failed\n");
+    return -1;
+  }
+  /* GPU 页表：V3D_DMA_GVA_BASE → pa（与 CPU 的 V3D_DMA_VA 各自独立） */
+  uint32_t pages = size / V3D_MMU_PAGE_SIZE;
+  for (uint32_t i = 0; i < pages; i++) {
+    v3d_mmu_map_page(g_pt, V3D_DMA_GVA_BASE + i * V3D_MMU_PAGE_SIZE,
+                     pa + i * V3D_MMU_PAGE_SIZE);
+  }
+  memset((void*)V3D_DMA_VA, 0, size);
+  /* 【必须 flush TLB】页表是在 MMU 已启用之后改的，不刷的话 GPU
+   * 走的是陈旧翻译——表现为 GPU 读 arena 读到旧内容/0
+   * （readback diff=8/16）。 */
+  v3d_mmu_flush(g_v3d);
+  g_dma.pa = pa;
+  g_dma.size = size;
+  g_dma.used = 0;
+  g_dma.va = (void*)V3D_DMA_VA;
+  g_dma.inited = 1;
+  printf("v3d_3d: dma arena pa=0x%08x cpu_va=0x%08x gva=0x%08x size=%u\n", pa,
+         (unsigned)V3D_DMA_VA, (unsigned)V3D_DMA_GVA_BASE, size);
+  return 0;
+}
+
+uint32_t v3d_dma_alloc(unsigned align, size_t size) {
+  if (dma_arena_init() != 0) {
+    return 0;
+  }
+  uint32_t a = align ? (uint32_t)align : 4096u;
+  if (a < 64u) {
+    a = 64u;
+  }
+  uint32_t off = (g_dma.used + (a - 1u)) & ~(a - 1u);
+  uint32_t need = (uint32_t)((size + (a - 1u)) & ~(a - 1u));
+  if (off + need > g_dma.size) {
+    printf("v3d_3d: dma arena out of space (want %u, left %u)\n", need,
+           g_dma.size - g_dma.used);
+    return 0;
+  }
+  g_dma.used = off + need;
+  return V3D_DMA_GVA_BASE + off; /* GPU VA 即 3D 后端的 IOVA */
+}
+
+void v3d_dma_free(uint32_t pa) { (void)pa; }
+
+/* aarch64 物理计数器 → 毫秒 */
+uint64_t v3d_tic_ms(void) {
+  uint64_t cnt = 0, frq = 0;
+  __asm__ volatile("mrs %0, cntpct_el0" : "=r"(cnt));
+  __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frq));
+  if (frq == 0) {
+    return 0;
+  }
+  return (cnt * 1000ull) / frq;
+}
+
+/* ---- CSD 提交（3D 用；2D 仍走 g2d_dispatch，不动已验证的路径） ---- */
+int v3d_g2d_run_csd(const v3d_g2d_csd_job_t* job, unsigned flags) {
+  if (job == NULL || job->code_iova == 0 || g_v3d == NULL) {
+    return -1;
+  }
+  if ((flags & V3D_G2D_RUN_PRE) != 0) {
+    if (job->src_phy != 0 && job->src_span != 0) {
+      v3d_g2d_invalidate_span(job->src_phy, job->src_span);
+    }
+    if (job->unif_iova != 0) {
+      v3d_g2d_invalidate_span(job->unif_iova, job->unif_span ? job->unif_span : 256u);
+    }
+  }
+
+  uint32_t num_batches = job->wg_count[0] ? job->wg_count[0] : 1u;
+  uint32_t cfg[8];
+  cfg[0] = job->wg_count[0] << 16;
+  cfg[1] = job->wg_count[1] << 16;
+  cfg[2] = job->wg_count[2] << 16;
+  cfg[3] = (1u << 8) | ((job->wg_size & 0xFFu) << 0);
+  cfg[4] = num_batches;
+  cfg[5] = job->code_iova | (1u << 2); /* PROPAGATE_NANS */
+  if (job->single_seg) {
+    cfg[5] |= (1u << 1);
+  }
+  if (job->threads == 4u) {
+    cfg[5] |= 1u;
+  }
+  cfg[6] = job->unif_iova;
+  cfg[7] = 0;
+
+  v3d_dev_t* v = g_v3d;
+  for (int w = 0; w < 2000; w++) {
+    if ((v3d_csd_status(v) & 3u) == 0) {
+      break;
+    }
+    usleep(100);
+  }
+  v->core0[V3D_CTL_INT_CLR / 4] = 0xFFFFFFFFu;
+  __asm__ volatile("dmb sy" ::: "memory");
+  v3d_csd_clear_int(v);
+  v3d_invalidate_caches(v);
+  v->core0[V3D_CTL_SLCACTL / 4] = V3D_SLCACTL_CLEAR_ALL;
+  __asm__ volatile("dmb sy" ::: "memory");
+
+  v3d_csd_submit(v, cfg);
+
+  int seen_busy = 0, retired = 0;
+  uint32_t budget = job->budget_ms ? job->budget_ms : 50u;
+  for (uint32_t i = 0; i < budget * 2000u; i++) {
+    uint32_t st = v->core0[V3D_CSD_STATUS / 4];
+    if (st & 0xFu) {
+      seen_busy = 1;
+    } else if (seen_busy || g2d_csd_retired(v, cfg)) {
+      retired = 1;
+      break;
+    }
+    __asm__ volatile("yield");
+  }
+  if (!retired) {
+    usleep(2000);
+  }
+
+  if ((flags & V3D_G2D_RUN_POST) != 0) {
+    if (job->dst_phy != 0 && job->dst_span != 0) {
+      v3d_g2d_invalidate_span(job->dst_phy, job->dst_span);
+    }
+  }
+  return 0;
+}
+
+/* 在 g2d_init 末尾调用：记下 v 与页表指针 */
+static void g2d_3d_bind(v3d_dev_t* v, volatile uint32_t* pt) {
+  g_v3d = v;
+  g_pt = pt;
+}
+
+/* 【L2 全失效】3D 的 CL/shader record 在 submit 前必须让 GPU 侧缓存失效。
+ * 与 2D dispatch 的 PRE 相同：SLCACTL 清 per-slice 缓存，L2TCACTL 清
+ * TMU 配置缓存。CT 取指走 L2T，不清会读到旧内容。 */
+void v3d_g2d_l2_invalidate_all(void) {
+  if (g_v3d == NULL) {
+    return;
+  }
+  v3d_invalidate_caches(g_v3d);
+  g_v3d->core0[V3D_CTL_SLCACTL / 4] = V3D_SLCACTL_CLEAR_ALL;
+  __asm__ volatile("dmb sy" ::: "memory");
+  g_v3d->core0[V3D_CTL_L2TCACTL / 4] = V3D_L2TCACTL_TMUCFCF;
+  for (int i = 0; i < 1000; i++) {
+    if (!(g_v3d->core0[V3D_CTL_L2TCACTL / 4] & V3D_L2TCACTL_TMUCFCF)) {
+      break;
+    }
+    usleep(10);
+  }
+}

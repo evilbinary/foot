@@ -29,6 +29,7 @@
 #include "v3d_mmu.h"
 #include "v3d_regs.h"
 #include "v3d_tfu.h"
+#include "v3d_3d.h"
 
 #include <signal.h>
 #include <unistd.h>
@@ -95,6 +96,21 @@ static inline uint64_t g2d_rd_frq(void) {
 
 /* CSD 2D 自测：256×256 ARGB8888 离屏 BO */
 #define G2D_TEST_VA 0x49000000UL  /* 用户态映射 */
+#define TRI_VA 0x4A000000UL       /* 3D 三角形测试的顶点缓冲映射 */
+
+/* 3D 精简版（v3d_3d_min.c） */
+int v3d_3d_init(void);
+uint32_t v3d_3d_cl_base(void);
+int v3d_3d_submit_cl(uint32_t bcl_start, uint32_t bcl_end,
+                     uint32_t rcl_start, uint32_t rcl_end, uint32_t w,
+                     uint32_t h);
+int v3d_3d_probe_rcl(void);
+int v3d_3d_clear_min(uint32_t fb_iova, uint32_t stride_bytes, uint32_t fmt,
+                     uint32_t w, uint32_t h, uint32_t rgba8);
+int v3d_3d_draw_min(uint32_t fb_iova, uint32_t stride_bytes, uint32_t fmt,
+                    uint32_t w, uint32_t h, uint32_t mode, uint32_t nverts,
+                    uint32_t pos_iova, uint32_t col_iova, uint32_t clear_rgba,
+                    int first_frame);
 #define G2D_TEST_GVA 0x31000000UL /* GPU 虚拟地址（避开 BO 0x30000000） */
 #define G2D_TEST2_VA 0x4B000000UL /* 第二块离屏 BO（blit/alpha 的 dst）；
                                    * 避开 mailbox 的 0x4A000000 */
@@ -473,6 +489,7 @@ static int v3d_init(void) {
 
   printf("v3d: backend ready (ver=%u ncores=%u)\n", ver, ncores);
 
+
   /* 从现在起接管 SIGTERM/SIGINT，退出时复位 V3D 硬件。
    * 没有这一步的话，被 kill 后硬件停在运行态，下次启动
    * 会看到 ree_cs=0x80000000 的脏状态。 */
@@ -482,6 +499,67 @@ static int v3d_init(void) {
    * 目的：验证 QPU 2D 内核能跑、uniform 传参正确。屏幕是 16bpp，
    * 上屏要另做格式转换，所以这里只在离屏 BO 上验证。 */
   if (v3d_g2d_init(&g_dev) == 0) {
+  /* ---- 3D 管线验证：画一个三角形 ----
+   * 只验证 CLE bin/render 这条链路能不能出像素，不做任何复杂效果。
+   * 顶点格式：pos = float3(stride 12)、col = RGBA byte4(stride 4)。 */
+  if (v3d_3d_init() == 0) {
+    /* 用 3D 的 identity DMA arena 分配：iova == pa，免手动映射 */
+    uint32_t vpa = v3d_dma_alloc(4096u, 512u);
+    if (vpa != 0) {
+      float* pos = (float*)v3d_dma_cpu(vpa);
+      uint8_t* col = (uint8_t*)v3d_dma_cpu(vpa + 256);
+      /* 屏幕坐标：NDC [-1,1] → [0,w]×[0,h]，y 向下（vtx shader 里 y 缩放为负） */
+      pos[0] = -0.8f; pos[1] = -0.8f; pos[2] = 0.5f;
+      pos[3] = 0.8f;  pos[4] = -0.8f; pos[5] = 0.5f;
+      pos[6] = 0.0f;  pos[7] = 0.8f;  pos[8] = 0.5f;
+      col[0] = 255; col[1] = 0; col[2] = 0; col[3] = 255;   /* 红 */
+      col[4] = 0; col[5] = 255; col[6] = 0; col[7] = 255;   /* 绿 */
+      col[8] = 0; col[9] = 0; col[10] = 255; col[11] = 255; /* 蓝 */
+      foot_cache_clean(v3d_dma_cpu(vpa), v3d_dma_cpu(vpa + 512));
+
+      /* 【终极内存验证】用已验证的 2D blit 内核读回 arena：
+       * GPU 读 identity arena 的结果 == CPU 写入？
+       *   diff=0  → 内存通路正常，CT 取指失败是 CT 自身问题
+       *   diff>0  → GPU 读 arena 就是坏的——CT「取 1 字节停」完全解释通，
+       *             修复方向 = 把 CL/shader 挪进 2D 已验证的 g2d arena */
+      {
+        /* v3d_g2d_blit_gpu 已由 v3d_g2d.h 声明 */
+        uint32_t rdst = vpa + 512;
+        int brc = v3d_g2d_blit_gpu(&g_dev, vpa, rdst, 16, 1);
+        foot_cache_invalidate(v3d_dma_cpu(rdst), v3d_dma_cpu(rdst + 64));
+        volatile unsigned int* s = (volatile unsigned int*)v3d_dma_cpu(vpa);
+        volatile unsigned int* d = (volatile unsigned int*)v3d_dma_cpu(rdst);
+        int diff = 0;
+        for (int k = 0; k < 16; k++) {
+          if (s[k] != d[k]) {
+            diff++;
+          }
+        }
+        printf("v3d_3d: readback rc=%d diff=%d/16 s0=%08x d0=%08x\r\n", brc,
+               diff, s[0], d[0]);
+      }
+
+      /* 实验 0：最小 render CL（Common + END），读 CT1CA 定位 CT 消费量 */
+      int prc0 = v3d_3d_probe_rcl();
+      printf("v3d_3d: probe rc=%d\r\n", prc0);
+
+      /* 实验 1：只跑 render 的整屏清色（绕开 binner）——
+       * EwokOS 注明 clear 是该硅片上唯一被证明能跑完的路径。 */
+      int crc = v3d_3d_clear_min(FB_GVA, (uint32_t)g_screen.pitch,
+                                 V3D_3D_FMT_BGR565, 640, 480, 0xFF0000FFu);
+      printf("v3d_3d: clear rc=%d (屏幕左上 640x480 应变纯色)\n", crc);
+
+      int trc = v3d_3d_draw_min(FB_GVA, (uint32_t)g_screen.pitch,
+                                V3D_3D_FMT_BGR565, 640, 480,
+                                V3D_3D_MODE_TRIANGLES, 3, vpa, vpa + 256,
+                                0xFF000000u, 1);
+      printf("v3d_3d: triangle rc=%d (expect %d)\n", trc, V3D_3D_DONE);
+    } else {
+      printf("v3d_3d: vertex buffer alloc failed\n");
+    }
+  } else {
+    printf("v3d_3d: init failed\n");
+  }
 #if G2D_SELFTEST
     uint32_t tpa = 0, tsize = 0;
     foot_cap_t tcap =
@@ -967,6 +1045,44 @@ static int v3d_bo_offset(void* args) {
   return (int)g_bos[r->handle - 1].gva;
 }
 
+/* CL 提交（Mesa 桥接）：handle=0 用内部测试 CL，否则解析 BO 的 GPU VA */
+static int v3d_submit_cl(void* args) {
+  gpu_submit_cl_req* r = (gpu_submit_cl_req*)args;
+  if (r == NULL) {
+    return -1;
+  }
+  if (v3d_3d_init() != 0) {
+    return -2;
+  }
+
+  uint32_t bs, be, rs, re;
+  if (r->bcl_handle == 0) {
+    uint32_t base = v3d_3d_cl_base();
+    bs = base + r->bcl_start;
+    be = base + r->bcl_end;
+  } else {
+    if (r->bcl_handle > V3D_MAX_BOS || !g_bos[r->bcl_handle - 1].in_use) {
+      return -3;
+    }
+    uint32_t bg = g_bos[r->bcl_handle - 1].gva;
+    bs = bg + r->bcl_start;
+    be = bg + r->bcl_end;
+  }
+  if (r->rcl_handle == 0) {
+    uint32_t base = v3d_3d_cl_base();
+    rs = base + r->rcl_start;
+    re = base + r->rcl_end;
+  } else {
+    if (r->rcl_handle > V3D_MAX_BOS || !g_bos[r->rcl_handle - 1].in_use) {
+      return -3;
+    }
+    uint32_t rg = g_bos[r->rcl_handle - 1].gva;
+    rs = rg + r->rcl_start;
+    re = rg + r->rcl_end;
+  }
+  return v3d_3d_submit_cl(bs, be, rs, re, r->w, r->h);
+}
+
 static int v3d_bo_destroy(void* args) {
   gpu_bo_ref* r = (gpu_bo_ref*)args;
   if (r == NULL || r->handle == 0 || r->handle > V3D_MAX_BOS) {
@@ -1220,7 +1336,7 @@ const gpu_backend_t v3d_backend = {
     .bo_mmap = NULL, /* CPU 映射在应用侧（foot_cap_alloc_frame） */
     .bo_destroy = v3d_bo_destroy,
     .bo_offset = v3d_bo_offset,
-    .submit_cl = NULL,
+    .submit_cl = v3d_submit_cl,
     .submit_csd = NULL,
     .submit_tfu = v3d_submit_tfu,
     .wait_bo = NULL,

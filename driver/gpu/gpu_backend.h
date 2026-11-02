@@ -152,6 +152,19 @@ typedef struct {
   unsigned int flags;
 } gpu_present_req;
 
+/* ---- CL 提交（Mesa 桥接用，对齐 V3D_SUBMIT_CL 的最小集）----
+ * CL 由应用侧（Mesa）生成，放在 BO 里；handle==0 表示用 gpud 内部
+ * 自建的测试 CL（此时 start/end 是相对内部 CL 缓冲的偏移）。 */
+typedef struct {
+  unsigned int bcl_handle; /* bin CL 所在 BO 句柄，0 = 内部测试 CL */
+  unsigned int bcl_start;  /* BO 内偏移（字节） */
+  unsigned int bcl_end;    /* 结束偏移（exclusive） */
+  unsigned int rcl_handle; /* render CL 所在 BO 句柄，0 = 内部 */
+  unsigned int rcl_start;
+  unsigned int rcl_end;
+  unsigned int w, h;       /* 渲染目标尺寸（tile 配置用） */
+} gpu_submit_cl_req;
+
 
 /* ---------------- 后端抽象 ---------------- */
 typedef struct gpu_backend {
