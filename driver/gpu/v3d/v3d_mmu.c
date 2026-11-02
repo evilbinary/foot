@@ -19,6 +19,9 @@
 
 #include "v3d_regs.h"
 
+/* 页表 PTE 落盘（见 v3d_mmu_map_page 的说明） */
+extern void foot_cache_clean(void* start, void* end);
+
 /* 寄存器按 word 索引访问：hub + off/4 */
 static inline uint32_t rd32(volatile uint32_t* p) {
   uint32_t v = *p;
@@ -106,6 +109,20 @@ void v3d_mmu_map_page(volatile uint32_t* pt, uint32_t va, uint32_t pa) {
   pt[idx] = ((pa >> V3D_MMU_PAGE_SHIFT) & V3D_PTE_PFN_MASK) |
             V3D_PTE_WRITEABLE | V3D_PTE_VALID;
   __asm__ volatile("dmb sy" ::: "memory");
+
+  /* 【必须 clean 到 DRAM】页表在我们的实现里是 cached 映射：只写 CPU
+   * cache 的话，GPU 读页表看到的是 0（未映射）→ 访问被 MMU 兜底到
+   * scratch 页 → GPU 读回全 0（实测 readback diff=8/16、CT 取指停在
+   * 第一条 opcode）。
+   *
+   * EwokOS 的 dma_alloc 是 uncached，页表写入直接落 DRAM，所以他们的
+   * v3d_mmu_map_page 不需要这步 —— 这正是移植时漏掉的差异。
+   *
+   * 注意：g2d arena 能正常工作是巧合——它的映射发生在 MMU setup 之前，
+   * 之后的「整表 clean」（backend 里 foot_cache_clean(PT_VA, PT_BYTES)）
+   * 顺带把它落盘了；而 dma arena 是运行时映射，错过了那次 clean。 */
+  foot_cache_clean((void*)(&pt[idx]), (void*)(&pt[idx] + 1));
+  __asm__ volatile("dsb sy" ::: "memory");
 }
 
 uint32_t v3d_mmu_ctl(v3d_dev_t* v) {
