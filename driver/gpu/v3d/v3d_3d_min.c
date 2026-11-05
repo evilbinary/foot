@@ -52,6 +52,50 @@
 #define CLE_CT0PC    0x128u   /* control thread 0 prim counter               */
 #define V3D_ERR_STAT 0xf20u   /* core error status                           */
 #define V3D_INT_STS  0x50u    /* interrupt status (flush-complete/error bits)*/
+#define V3D_INT_CLR  0x58u    /* interrupt clear（write-1-to-clear，Linux 中断里写）*/
+#define CLE_INT_MSK_STS 0x5cu /* 中断屏蔽状态（读） */
+#define CLE_INT_MSK_SET 0x60u /* 中断屏蔽置位（写 1 = 屏蔽） */
+#define CLE_INT_MSK_CLR 0x64u /* 中断屏蔽清除（写 1 = 解除屏蔽） */
+
+/* 是否按 Linux v3d_irq_enable() 解屏蔽 CLE 完成中断。
+ *
+ * 【当前设为 0：对齐参考仓库已跑通的裸机 clear 路径】
+ * videocore7-exps 的 v3d_submit_render() 完全不解屏蔽、不碰 INT_STS，
+ * 只轮询 RFC 递增；它在真机上连续跑通了多次 clear。Linux 解屏蔽是为了
+ * 用 fence 唤醒调度器，硬件执行/退役本身并不依赖 IRQ mask。YiYiYa 没有
+ * 注册 V3D 中断处理函数，解屏蔽只会多一个未处理的中断源，先把变量摘掉。 */
+#define V3D_3D_ENABLE_CLE_IRQ 0
+
+/* CT1QCFG(0x178)：上电默认就是 ETFILT|ETPROC = 0xC0。
+ *
+ * 【绝对不要写 0】附录 I.3 #5 / 历史实测：把 0x178 当 CT1CFG 清 0 之后，
+ * CT1 一个字节都取不出来（probe consumed=0）。videocore7-exps 写 0 的那条
+ * CLE clear 路径本身没在 Pi5 上作为权威配方验证过（能跑通的是 CSD g2d）。
+ * Linux 对这个寄存器是 "XXX: Set the QCFG"（保留默认，不写）。
+ * 提交时也不要每次强写 0xC0——保持硬件默认即可。 */
+#define CLE_QCFG_ETFILT (1u << 7)
+#define CLE_QCFG_ETPROC (1u << 6)
+#define CLE_L2TCACTL 0x30u    /* L2T cache 控制（bit0 是失效忙位） */
+
+/* 中断位定义照 drivers/gpu/drm/v3d/v3d_regs.h（V3D 7.1）：
+ *   V3D_INT_FRDONE  BIT(0)   render 完成
+ *   V3D_INT_FLDONE  BIT(1)   bin 完成
+ *   V3D_INT_OUTOMEM BIT(2)   binner 池不够
+ *   V3D_INT_CSDDONE BIT(6)   CSD 完成（ver >= 71）
+ * 日志里长期看到的 int_sts=0x2 就是 FLDONE。 */
+#define V3D_INT_FRDONE  (1u << 0)
+#define V3D_INT_FLDONE  (1u << 1)
+#define V3D_INT_OUTOMEM (1u << 2)
+#define V3D_INT_CSDDONE (1u << 6)
+#define CLE_IRQS (V3D_INT_FRDONE | V3D_INT_FLDONE | V3D_INT_OUTOMEM | \
+                  V3D_INT_CSDDONE)
+/* 【必须开启】GFXH-1742 段（mesa v3dx_rcl.c:638-645）不只是 workaround：
+ * 它同时提供了从「load 模式」切到「render 模式」的 END_OF_LOADS(0x1A)，
+ * 以及首个 tile 的 CLEAR_RENDER_TARGETS(0x19) + END_OF_TILE_MARKER(0x1B)。
+ * 之前为二分把它关掉，结果 CT1 在 0x7C 之后一直等「切模式」信号，
+ * 卡住不动（ct1ca 恒 +9、CTRUN 不清）。 */
+#define V3D_3D_ENABLE_GFXH1742 1
+
 #define V3D_3D_CL_MAX      (64u * 1024u)   /* control-list buffer           */
 #define V3D_3D_POOL_SIZE   (256u * 1024u)  /* binning tile-alloc pool       */
 #define V3D_3D_TSDA_SIZE   (64u * 1024u)   /* tile-state data array         */
@@ -162,6 +206,12 @@ static uint32_t _unif_p;
 static uint32_t* _cs_unif_va; /* coord（binning）shader 的 uniform */
 static uint32_t _cs_unif_p;
 
+/* CT1QCFG(0x178) 的初值。这个寄存器的默认值一旦被清成 0，CT1 就取不出
+ * 命令（历史注释记录过：EwokOS 把它当 CT1CFG 写 0 之后彻底不工作）。
+ * 我们在超时现场读到的却一直是 0x0 —— 先确认「初始是不是 0」，再决定
+ * 要不要每次提交前恢复。 */
+static uint32_t _qcfg_init;
+
 static uint32_t _frag_iova;
 static uint32_t _vtx_iova;
 static uint32_t _coord_iova;
@@ -172,6 +222,12 @@ static uint32_t _gen_p;
 
 /* 当前作业描述（超时日志里打出来，便于定位是哪次 draw） */
 static char _job_desc[128];
+
+/* CT1 卡死后不会自己恢复（本模块没有 reset 通路），后续每次 render 提交都
+ * 只会白烧 5M 次 yield 并打一份同样的超时日志，而且 CT1CA 会一直停在上一
+ * 次的值上——很容易被误读成「这一次也卡在同一个包」。置位后直接跳过并明确
+ * 打一行，日志就能区分「第一次卡死」和「后面的无效提交」。 */
+static int _ct1_wedged;
 
 /* 前向声明：wait_flush 里会调用，定义在后面 */
 static void stalled(const char* why);
@@ -321,18 +377,82 @@ static void build_attr_records(uint32_t pos_iova, uint32_t col_iova)
     a[28] = 0xFF; a[29] = 0xFF; a[30] = 0xFF; a[31] = 0xFF;
 }
 
-static int wait_flush(volatile uint32_t *core, uint32_t reg, uint32_t before)
+/* 等 CT 完成。判据有两套，**必须都看**：
+ *
+ *  1) BFC/RFC（flush 计数）—— 只有 CL 里出现 FLUSH(0x04) 才会递增。
+ *     bin 的 CL 结尾有 FLUSH，所以能用；**Mesa 的 render CL 没有 FLUSH**，
+ *     RFC 永远不动 —— 只等它必然 100% 超时（实测 clear/triangle 都这样）。
+ *
+ *  2) CTnCS 的 CTRUN(BIT5) 清零 —— CT 执行完整个 CL 就清。
+ *     这是 render 唯一可靠的完成信号（probeC [Common+END] 实测 ct1cs=0x0
+ *     而 RFC 纹丝不动）。
+ *
+ * 为避免「刚写完 QEA、CT 还没置起 CTRUN 就被判完成」的竞态，
+ * CTRUN 判据要等轮询超过 STARTUP_SPIN 次之后才生效。 */
+#define CT_DONE_STARTUP_SPIN 200000u
+
+/* 上一次 wait_flush 是走中断判据（无最高位）还是走 CTRUN 兜底（最高位置位） */
+static uint32_t _last_spins;
+
+static int wait_flush(volatile uint32_t *core, uint32_t irq_bit,
+                      uint32_t cnt_reg, uint32_t cnt_before,
+                      uint32_t cs_reg, uint32_t ca_reg, uint32_t ea)
 {
-    /* 【不用时钟】用户态读 cntpct_el0 会触发异常（实测整个 gpud 卡死、
-     * 连 stalled() 的日志都出不来）。改成纯计数自旋：
-     *   每次 yield 约 1~2us（单核被让出再回来），500 万次 ≈ 5~10s，
-     *   比原 1s 预算宽松，保证 bin/render 有足够时间跑完。 */
+    /* 三个判据按可靠性排列：
+     * 1) 计数递增（BFC/RFC）—— EwokOS 的判据，job 真正退役才会动；
+     * 2) 中断位（FLDONE/FRDONE）—— Linux 的判据，但需要先解屏蔽；
+     * 3) CTRUN 清零 + CA 到末尾 —— 兜底，注意 CLE 出错时也会停转。
+     * 原来只有 3)，所以「job 没真正结束就写下一个 QBA/QEA」把 CLE 弄坏了
+     * （连续 3~5 次后不再取 job，ct1ca 停在 QBA、ct1cs 0x30）。
+     *
+     * _last_spins 记录走的是哪条（日志里 [CNT] / [INT] / [兜底]）：
+     * 只有 3) 命中时置最高位，2) 命中时置次高位。 */
+    _last_spins = 0xFFFFFFFFu;
     for (uint32_t i = 0; i < 5000000u; i++) {
-        if (core[reg / 4] != before)
+        uint32_t sts;
+
+        if (cnt_reg != 0 && core[cnt_reg / 4] != cnt_before) {
+            sts = core[V3D_INT_STS / 4];
+            if (sts != 0u)
+                core[V3D_INT_CLR / 4] = sts;
+            _last_spins = i;
             return 0;
-        __asm__ volatile("yield");
+        }
+        sts = core[V3D_INT_STS / 4];
+        if ((sts & irq_bit) != 0u) {
+            core[V3D_INT_CLR / 4] = sts;         /* ack 整值，同 Linux */
+            __asm__ __volatile__("dsb sy" ::: "memory");
+            _last_spins = i | 0x40000000u;
+            return 0;
+        }
+        if (cs_reg != 0 && i > CT_DONE_STARTUP_SPIN &&
+            (core[cs_reg / 4] & 0x20u) == 0) {   /* CTRUN 清零 = 停转 */
+            /* 【只能认 CA == EA】CLE 出错停转时 CA 可能还在很后面/很前面，
+             * 用 >= 会把「CA 跑到 +65536、EA 只有 333」的失败判成成功
+             * （triangle 实测）。成功完成时 CA 必须正好停在 CL 末尾。 */
+            _last_spins = i | 0x80000000u;
+            return (ca_reg == 0 || core[ca_reg / 4] == ea) ? 0 : -1;
+        }
+        __asm__ __volatile__("yield");
     }
     return -1;
+}
+
+/* 清 CLE 的完成中断状态。Linux 的 v3d 中断处理里必做（往 INT_CLR 写读到的
+ * INT_STS）。我们全程轮询、从不写它，于是 INT_STS 从上电起就一直挂着 0x2。
+ *
+ * 【为什么这是「第二次提交就挂」的元凶候选】实测同一个 CL 连续提交：前 4 次
+ * 都正常进队并执行完（ct1ca +len/len），第 5 次起 CT1 一个字节都不消费
+ * （ct1ca +0、ct1cs 0x30），而且加 1~2 秒空转也没用 —— 说明不是「收尾没
+ * 做完」，而是完成事件没有被回收，硬件那边的 job 槽位回不来。 */
+static uint32_t cle_clear_int(volatile uint32_t *core)
+{
+    uint32_t sts = core[V3D_INT_STS / 4];
+    if (sts != 0u) {
+        core[V3D_INT_CLR / 4] = sts;            /* write-1-to-clear */
+        __asm__ __volatile__("dsb sy" ::: "memory");
+    }
+    return sts;                                 /* 清之前的值，供日志分析 */
 }
 
 static int submit_bin(volatile uint32_t *core, uint32_t start, uint32_t end)
@@ -347,10 +467,9 @@ static int submit_bin(volatile uint32_t *core, uint32_t start, uint32_t end)
     uint32_t err_before = core[V3D_ERR_STAT / 4];
     int rc;
 
-    /* 清 bin 线程的 boot-time halt —— 与 render 侧的 CT1CS=0 同理
-     * （裸金属 bring-up 的 v3d_submit_bin 也写 CT0CS=0）。不写的话
-     * CT0 从上电起就 parked，第一个命令都取不出来。 */
-    core[CLE_CT0CS / 4] = 0;
+    /* 【不写 CT0CS】同 render 侧：Linux 的 v3d_sched.c 只写
+     * CT0QMA/CT0QMS/CT0QTS/CT0QBA/CT0QEA，从不写 CT0CS。
+     * 写 0 会复位控制线程（bin 反而一直能跑完，说明本来就不需要）。 */
     core[CLE_CT0QMA / 4] = _pool_p;
     core[CLE_CT0QMS / 4] = V3D_3D_POOL_SIZE;
     core[CLE_CT0QTS / 4] = (1u << 1) | _tsda_p;   /* enable | page-aligned tsda */
@@ -359,7 +478,9 @@ static int submit_bin(volatile uint32_t *core, uint32_t start, uint32_t end)
     v3d_g2d_l2_invalidate_all();
     core[CLE_CT0QBA / 4] = start;
     core[CLE_CT0QEA / 4] = end;                   /* write starts the job */
-    rc = wait_flush(core, CLE_BFC, before);
+    rc = wait_flush(core, V3D_INT_FLDONE, CLE_BFC, before, CLE_CT0CS,
+                    CLE_CT0CA, end);
+    (void)cle_clear_int(core);
     if (rc != 0) {
         uint32_t mctl = 0, mvio = 0, mid = 0, mint = 0;
         int mf = v3d_g2d_mmu_fault_peek(&mctl, &mvio, &mid, &mint);
@@ -390,47 +511,150 @@ static int submit_bin(volatile uint32_t *core, uint32_t start, uint32_t end)
         /* CT0 is stuck mid-job: reset the block so later dispatches (2D/CSD
          * included) do not wait out their budget behind it. */
         stalled("bin timeout");
+    } else {
+        /* 【成功路径也要看 bpca】bfc 递增只说明 bin CL 执行完了，不代表
+         * 产出了 tile 描述。bpca == base 意味着 binner 一个 tile 都没写，
+         * 那么 render 的 tile list 是空的，CT1 在 START_ADDRESS_OF_
+         * GENERIC_TILE_LIST(0x14) 处会死等（实测 ct1ca 恒在 0x14 末尾、
+         * ct1ra=0 从未进入子列表）。这是当前唯一还没确认的环节。 */
+        slog("v3d_3d: BIN ok bfc %u->%u bpca 0x%x(+%u) bpcs 0x%x cl_in %u\r\n",
+             before, core[CLE_BFC / 4], core[PTB_BPCA / 4],
+             core[PTB_BPCA / 4] - _pool_p, core[PTB_BPCS / 4],
+             end - start);
+        /* bin 成功但 ERR_STAT 新置位时单独一行：render 超时日志里的 err 是
+         * 粘性锁存，只有把它归到「哪一次提交产生」才有意义。实测 render
+         * 超时时 err 恒为 0x1000 且 new=0，说明它在 render 之前就有了 ——
+         * 这里能确认它是不是 binner 产生的。 */
+        if (core[V3D_ERR_STAT / 4] != err_before)
+            slog("v3d_3d: BIN err %x->%x new %x\r\n",
+                 err_before, core[V3D_ERR_STAT / 4],
+                 core[V3D_ERR_STAT / 4] & ~err_before);
+    }
+    return rc;
+}
+
+/* 【CL hex dump】超时时把 CL 前 80 字节和「已消费位置」一起打出来，
+ * 用于判断 CT 停在哪条命令上（裸机环境没有其它手段）。 */
+static void dump_cl(const char *tag, uint32_t start, uint32_t consumed) {
+    const uint8_t *p = (const uint8_t *)v3d_dma_cpu(start);
+    uint32_t n = 80;
+    uint32_t i;
+    slog("v3d_3d: %s CL dump (consumed=%u):\r\n", tag, consumed);
+    for (i = 0; i < n; i += 16) {
+        slog("  %3u:%s %02x %02x %02x %02x %02x %02x %02x %02x "
+             "%02x %02x %02x %02x %02x %02x %02x %02x\r\n",
+             i, (i <= consumed && consumed < i + 16) ? ">" : " ",
+             p[i+0], p[i+1], p[i+2], p[i+3], p[i+4], p[i+5], p[i+6], p[i+7],
+             p[i+8], p[i+9], p[i+10], p[i+11], p[i+12], p[i+13], p[i+14],
+             p[i+15]);
+    }
+}
+
+/* settle: 写 QBA/QEA 之前先空转的 yield 次数（探针用它区分「CLE 收尾没完」
+ * 和「必须 re-arm」两种可能）。clear_cs: 写 QBA/QEA 前把 CT1CS 清 0
+ * （EwokOS 裸机 bring-up 的做法，用来验证“每次提交是否需要显式 re-arm”）。 */
+static int submit_render_ex(volatile uint32_t *core, uint32_t start,
+                            uint32_t end, uint32_t settle, int clear_cs)
+{
+    uint32_t before = core[CLE_RFC / 4];
+    /* ERR_STAT 是粘性锁存：绝对值里混着更早实验的位，只有「这次提交期间新
+     * 出现的位」能归因到本次 job。bin 侧早就在做这个差分，render 侧原来只
+     * 打绝对值（日志里那个 0x1000 就是没法定性的老锁存）。 */
+    uint32_t err_before = core[V3D_ERR_STAT / 4];
+    uint32_t ca_before = core[CLE_CT1CA / 4];
+    uint32_t i;
+    uint32_t sts_after;
+    int rc;
+
+    if (_ct1_wedged) {
+        slog("v3d_3d: RENDER skipped (CT1 已在之前的提交里卡死，需要重启 GPU 服务/整机)\r\n");
+        return -1;
+    }
+
+    /* 跨 gpud 进程残留：上一次超时把 CT1 留在 CTRUN=1，本进程若没做
+     * SMS reset 就会在这里看见。CA 常停在旧 arena 的 +4096 页边界，
+     * 看起来像「这次 CL 跑了 4K」其实是残值。 */
+    {
+        uint32_t cs_pre = core[CLE_CT1CS / 4];
+        if ((cs_pre & 0x20u) != 0u) {
+            slog("v3d_3d: RENDER aborted — CT1 already CTRUN "
+                 "ct1cs=0x%x ca=0x%x (需要 SMS/PM reset，勿解读为本 CL 进度)\r\n",
+                 cs_pre, core[CLE_CT1CA / 4]);
+            _ct1_wedged = 1;
+            return -1;
+        }
+    }
+
+    if (settle != 0u) {
+        for (i = 0; i < settle; i++)
+            __asm__ __volatile__("yield");
+    }
+
+    /* 【提交序列——以本仓库已跑通 probeA/B/C 的做法为准】
+     *   1) L2T + slice 全失效：bin 刚从同一 _cl_p 取过指，L2T 里可能还
+     *      留着旧 bin CL；CPU dma_clean 只推 ARM cache，推不掉 V3D L2T。
+     *      Linux v3d_render_job_run() 每次提交前也做 invalidate。
+     *   2) 【不写 CT1QCFG】默认 0xC0；写 0 会让 CT1 停取（附录 I.3 #5）。
+     *   3) 【不写 CT1CS】Linux 只写 QBA/QEA；写 0 会留下假 CA 残值。
+     *      CT1 真卡死只能靠 SMS/PM 复位（backend 启动时检测 CTRUN）。
+     *   4) 只写 QBA/QEA 启动；完成靠 wait_flush 的 CTRUN+CA 兜底
+     *      （render CL 无 FLUSH，RFC 不会动）。 */
+    v3d_g2d_l2_invalidate_all();
+    (void)clear_cs;
+    __asm__ __volatile__("dsb sy" ::: "memory");
+    core[CLE_CT1QBA / 4] = start;
+    core[CLE_CT1QEA / 4] = end;
+    rc = wait_flush(core, V3D_INT_FRDONE, CLE_RFC, before, CLE_CT1CS,
+                    CLE_CT1CA, end);
+    sts_after = cle_clear_int(core);
+    if (rc != 0) {
+        uint32_t ct1ca = core[CLE_CT1CA / 4];
+        uint32_t err_after = core[V3D_ERR_STAT / 4];
+        slog("v3d_3d: RENDER timeout rfc %u->%u intsts 0x%x ct0cs 0x%x ct1cs 0x%x cl [%u,%u)\r\n",
+             before, core[CLE_RFC / 4], core[V3D_INT_STS / 4],
+             core[CLE_CT0CS / 4], core[CLE_CT1CS / 4], start, end);
+        /* CT1CA/CT1RA 是定位关键：CA=消费到 CL 的哪个字节、
+         * RA=子列表返回地址。CT1CA==start 表示一个命令都没消费；
+         * ==start+1 表示第一条 opcode 之后停住。
+         *
+         * 【必须打相对偏移】CL 缓冲换过地址后绝对地址没有可比性；而且
+         * 一次卡死之后 CT1 不会自己恢复，后续提交的 CA 会一直停在上一次
+         * 留下的值上（三角形那次 +52 就是 clear 留下的残值，不是它自己
+         * 的执行进度）。相对偏移配 tools/v3d_cl_decode.py 才能一眼看出
+         * 停在哪个包的哪个字节。 */
+        slog("v3d_3d: RENDER ct1ca +%d ct1ra 0x%x ct1lc %u err %x->%x new %x\r\n",
+             (int)(ct1ca - start), core[CLE_CT1RA / 4],
+             core[CLE_CT1LC / 4], err_before, err_after,
+             err_after & ~err_before);
+        /* 回读队列寄存器：确认「写进去的 QBA/QEA 有没有被硬件接受/改掉」。
+         * 若 qba/qea 仍然等于我们写的值而 CA 不动，说明 job 入队了但线程
+         * 没被唤醒；若被改掉，说明硬件在校验/丢弃这个 job。 */
+        slog("v3d_3d: RENDER qba 0x%x qea 0x%x qcfg 0x%x wrote [0x%x,0x%x)\r\n",
+             core[CLE_CT1QBA / 4], core[CLE_CT1QEA / 4],
+             core[CLE_CT1QCFG / 4], start, end);
+        dump_cl("RENDER", start, ct1ca - start);
+        _ct1_wedged = 1;
+        stalled("render timeout");
+    } else {
+        /* 成功也留一行：确认 CA 走到了 CL 末尾、RFC 有没有递增，避免
+         * 「rc=0 但什么都没画」的情况没有数据可看。 */
+        /* 【假成功识别】CA 在这次提交前后完全没变、又正好等于 EA，说明
+         * 硬件很可能根本没执行这个 job（典型场景：同地址同长度重发，
+         * QEA 与上次相同）。这种 rc=0 不能当成「跑通了」。 */
+        slog("v3d_3d: RENDER ok rfc %u->%u ct1ca +%d/%u ct1cs 0x%x int_sts 0x%x spin 0x%x%s%s\r\n",
+             before, core[CLE_RFC / 4], (int)(core[CLE_CT1CA / 4] - start),
+             end - start, core[CLE_CT1CS / 4], sts_after, _last_spins,
+             (_last_spins & 0x80000000u) ? " [兜底]"
+                 : ((_last_spins & 0x40000000u) ? " [INT]" : " [CNT]"),
+             (ca_before == core[CLE_CT1CA / 4] && ca_before == end)
+                 ? "  <-- CA 未变化，可能未执行" : "");
     }
     return rc;
 }
 
 static int submit_render(volatile uint32_t *core, uint32_t start, uint32_t end)
 {
-    uint32_t before = core[CLE_RFC / 4];
-    int rc;
-
-    v3d_g2d_l2_invalidate_all();
-    /* 【不写 CT1QCFG】原 EwokOS 把 0x178 标成 CT1CFG 并写 0，实际 0x178 是
-     * V3D_CLE_CT1QCFG（队列配置）——写 0 清掉了硬件上电默认值，CT1 从此
-     * 一个字节都取不出来（probe consumed=0、ct1cs CTERR|CTSUBS）。
-     * Linux 对这个寄存器的处理是 "XXX: Set the QCFG"（保留默认）。
-     * 真正的 CT1CFG 在 0x144，本路径无需写它。 */
-    /* Clear a boot-time halt on the render CLE thread before ringing CT1.
-     * The proven bare-metal bring-up (videocore7-exps/app/src/v3d.c,
-     * v3d_submit_render) writes CT1CS = 0 at exactly this point; the EwokOS
-     * port dropped it.  Without the write the render control thread stays
-     * parked from boot, the CT1 job never advances and CLE_RFC never
-     * increments, so wait_flush burns its whole deadline and every dispatch
-     * (even the shader-less probe clear) degrades to V3D_3D_FAILED -- which
-     * latches the client's GPU path off and drops shadertoy to the CPU. */
-    core[CLE_CT1CS / 4] = 0;
-    __asm__ __volatile__("dsb sy" ::: "memory");
-    core[CLE_CT1QBA / 4] = start;
-    core[CLE_CT1QEA / 4] = end;
-    rc = wait_flush(core, CLE_RFC, before);
-    if (rc != 0) {
-        slog("v3d_3d: RENDER timeout rfc %u->%u intsts 0x%x ct0cs 0x%x ct1cs 0x%x cl [%u,%u)\r\n",
-             before, core[CLE_RFC / 4], core[V3D_INT_STS / 4],
-             core[CLE_CT0CS / 4], core[CLE_CT1CS / 4], start, end);
-        /* CT1CA/CT1RA 是定位关键：CA=消费到 CL 的哪个字节、
-         * RA=子列表返回地址。CT1CA==start 表示一个命令都没消费；
-         * ==start+1 表示第一条 opcode 之后停住。 */
-        slog("v3d_3d: RENDER ct1ca 0x%x ct1ra 0x%x ct1lc 0x%x err 0x%x\r\n",
-             core[CLE_CT1CA / 4], core[CLE_CT1RA / 4],
-             core[CLE_CT1LC / 4], core[V3D_ERR_STAT / 4]);
-        stalled("render timeout");
-    }
-    return rc;
+    return submit_render_ex(core, start, end, 0u, 0);
 }
 
 static uint32_t build_bcl_empty(uint32_t w, uint32_t h)
@@ -440,15 +664,21 @@ static uint32_t build_bcl_empty(uint32_t w, uint32_t h)
     off = cl_u8(off, 0x77);                     /* NUMBER_OF_LAYERS */
     off = cl_u8(off, 0x00);                     /* layers - 1 = 0 */
     off = cl_u8(off, 0x78);                     /* TILE_BINNING_MODE_CFG */
-    off = cl_u8(off, (1u << 4) | (0u << 2));    /* block 128b, initial 64b (matches RCL 0x7E) */
-    /* 64px tiles (log2t=3), matching build_draw_bcl/build_draw_rcl.  The clear
-     * bin previously used 16px tiles (log2t=1): at 1280x800 that is 80x50=4000
-     * tiles, and the binner's per-tile allocation overran the 256 KiB pool
-     * (bpca pinned at base+0x40000, bpcs 0) so the bin flush never landed and
-     * v3d_3d_clear timed out -> pgl_g3d probe-clear failed -> GPU latched off
-     * for the whole session.  64px tiles cut it to 20x13=260 tiles, the same
-     * geometry the draw path already completes with. */
-    off = cl_u8(off, (3u << 3) | (3u << 0));    /* log2 tile h/w = 3 (64px) */
+    /* [foot] 两个 block size 不一样！mesa v3d_limits.h：
+     *   V3D_TILE_ALLOC_INITIAL_BLOCK_SIZE  = 128 → 枚举 1
+     *   V3D_TILE_ALLOC_OVERFLOW_BLOCK_SIZE =  64 → 枚举 0
+     * 位域：bits4-5 = tile_allocation_block_size（溢出块）
+     *       bits2-3 = tile_allocation_initial_block_size（初始块）
+     *
+     * 曾经把两者都写成 1（128B），结果 binner 每 tile 用 128+128=256B
+     * （实测 bpca = 80×256 = 0x5000），而 render 按 64B 溢出块遍历
+     * → 每个 tile 错位 64B → CT 卡在第一个 STORE 之后不动。 */
+    off = cl_u8(off, (0u << 4) | (1u << 2));    /* overflow 64b, initial 128b */
+    /* 16px tiles (log2t=1)，与 build_clear_rcl 的显式逐 tile 网格一致。
+     * 参考仓库验证过的空 bin 就是 16px；render 虽然不读 binner 的 tile
+     * list，但让 bin/render 的 tile 几何一致能少一个变量。640x480 正好
+     * 是 40x30 个整 tile。 */
+    off = cl_u8(off, (1u << 3) | (1u << 0));
     off = cl_u8(off, 0x00);
     off = cl_u8(off, 0x00);
     off = cl_u16le(off, w - 1u);
@@ -459,20 +689,27 @@ static uint32_t build_bcl_empty(uint32_t w, uint32_t h)
     return off;
 }
 
-static uint32_t build_clear_rcl(uint32_t fb_iova, uint32_t stride_bytes,
-                                uint32_t w, uint32_t h, uint32_t tile,
-                                uint32_t fmt, uint32_t rgba8, int rb_swap)
+/* RCL 前导配置：TILE_RENDERING_MODE_CFG_COMMON + RT_PART1 + ZS_CLEAR_VALUES。
+ * build_clear_rcl 与「clear 前缀梯度探针」共用，保证探针测的就是真实 CL 的
+ * 前缀，而不是另写一份可能已经跑偏的配置。
+ *
+ * log2t 是 Mesa 的 "log2 tile size in 8-pixel units"：16px tile -> 1，
+ * 64px tile -> 3。RT stride 也必须按 tile 宽度算。 */
+static uint32_t rcl_cfg_prefix(uint32_t off, uint32_t w, uint32_t h,
+                               uint32_t fmt, uint32_t rgba8, uint32_t log2t)
 {
-    uint32_t off = 0;
-    uint32_t tx = (w + tile - 1) / tile;
-    uint32_t ty = (h + tile - 1) / tile;
-    uint32_t log2t = 3;             /* 64 px tiles (tile arg must be 8<<log2t) */
-    uint32_t x, y, i;
-    /* clear color 按 RT 的实际格式（RGB565）打包；rgba8 约定 0xAARRGGBB */
+    uint32_t tile = 1u << (log2t + 3u);      /* 16px: log2t=1; 64px: log2t=3 */
+    /* clear color 按 V3D_INTERNAL_TYPE_8 的内部格式打包；rgba8 约定 0xAARRGGBB。
+     * 【必须是 RGBA8888，不是 RGB565】mesa v3dx_draw.c:1733 对
+     * V3D_INTERNAL_TYPE_8 用 PIPE_FORMAT_R8G8B8A8_UNORM 打包，32 位小端
+     * 布局是 A<<24 | B<<16 | G<<8 | R。之前在这里算 RGB565，0x1F 落进
+     * R 字节，屏幕上整片变成红色（实证）。 */
+    uint32_t a8 = (rgba8 >> 24) & 0xFFu;
     uint32_t r8 = (rgba8 >> 16) & 0xFFu;
     uint32_t g8 = (rgba8 >> 8) & 0xFFu;
     uint32_t b8 = rgba8 & 0xFFu;
-    uint32_t c565 = ((r8 >> 3) << 11) | ((g8 >> 2) << 5) | (b8 >> 3);
+    uint32_t c32 = (a8 << 24) | (b8 << 16) | (g8 << 8) | r8;
+    (void)fmt;                      /* internal type 目前固定 8（见 RT 注释） */
 
     /* TILE_RENDERING_MODE_CFG_COMMON (0x79, sub_id 0) */
     off = cl_u8(off, 0x79);
@@ -480,37 +717,35 @@ static uint32_t build_clear_rcl(uint32_t fb_iova, uint32_t stride_bytes,
     off = cl_u16le(off, w);
     off = cl_u16le(off, h);
     off = cl_u8(off, (1u << 6) | (1u << 4));    /* early_z_disable, depth_buf_disable */
-    /* v71: Log2 Tile Width 在参数 bit52-54（byte7 bit4-6），Log2 Tile Height
-     * 在 bit55-57 —— 跨 byte7 bit7 + byte8 bit0-1。EwokOS 把 byte8 写成 0，
-     * height 的高 2 位丢失，硬件按 16px 高的 tile 解析：640x480 要 300 个
-     * tile 而 CL 只有 80 个 tile 的命令 → CT1 找不到后续 tile 的命令
-     * 挂死（实测 ct1cs 卡 0x18、rfc 0->0）。 */
-    off = cl_u8(off, (uint8_t)((1u << 7) | (log2t << 4)));
+    /* v71: Log2 Tile Width 在 bit52-54（byte7 bit4-6），Log2 Tile Height
+     * 在 bit55-57 —— 跨 byte7 bit7 + byte8 bit0-1。按字段值直接写，
+     * 不能假定 log2t 的 bit0 恒为 1（老代码写死 1<<7，只对 64px 成立）。 */
+    off = cl_u8(off, (uint8_t)(((log2t & 1u) << 7) | (log2t << 4)));
     off = cl_u8(off, (uint8_t)((log2t >> 1) & 0x3u));
 
     /* TILE_RENDERING_MODE_CFG_RENDER_TARGET_PART1 (sub_id 2)。
      * v71 字段：sub_id(3) rt(3) base(11,单位512B,start7) stride(7,单位64B,
      * minus_one,start18) bpp(2,start25) type(5,start27) clear_low(32,start32)。
-     * base 11 位 @512B 只能覆盖 1MB —— 它只喂 LOAD；clear-only 不 load，
-     * 填 0（写屏幕由 STORE 的 32 位地址负责）。
-     * stride 按实际行距算；type=16ui(5)：RGB565 是 16 位无符号。
-     * EwokOS 原来stride用 tile/2-1=31（=2048B，行距 1280B 对不上）、
-     * type=8（8 位 unorm），clear 色也是 RGBA8 直接塞给 565 的 RT。 */
+     * 权威参数（mesa v3d_util.c / v3dx_format_table.c）：
+     *   stride = tile_width_px * internal_bpp_words / 2
+     *            （单位 128-bit，覆盖 2 行，内部 tile 布局的行距，
+     *             与图像行距无关——写屏幕靠 STORE 的 32 位地址）
+     *   BGR565: internal_type = V3D_INTERNAL_TYPE_8（枚举 8），
+     *           internal_bpp = 32（bpp_words = 1）
+     *   base_address 是内部 tile 缓冲的相对布局，不是 FB 地址 */
     {
-        /* 权威参数（mesa v3d_util.c / v3dx_format_table.c）：
-         *   stride = tile_width_px * internal_bpp_words / 2
-         *            （单位 128-bit，覆盖 2 行，内部 tile 布局的行距，
-         *             与图像行距无关——写屏幕靠 STORE 的 32 位地址）
-         *   BGR565: internal_type = V3D_INTERNAL_TYPE_8（枚举 8），
-         *           internal_bpp = 32（bpp_words = 1）
-         *   base_address 是内部 tile 缓冲的相对布局，不是 FB 地址 */
-        uint32_t rt_stride = (64u * 1u) / 2u;   /* = 32 */
+        /* 【字段存的是 stride - 1】v3d_packet_v71_pack.h:3699
+         *   cl[3] = bitpack(stride - 1, 2, 8) | base >> 16
+         *   cl[4] = bitpack(stride - 1, 2, 8) >> 8 | ...
+         * 即 7 位域（cl[3] bits2-7 = 低 6 位，cl[4] bit0 = 第 7 位）。
+         * 塞 rt_stride(32) 会让硬件按 stride=33 解析。 */
+        uint32_t rt_stride_m1 = tile / 2u - 1u;   /* 16px: 7; 64px: 31 */
         off = cl_u8(off, 0x79);
         off = cl_u8(off, 0x02);                 /* sub_id = 2, rt = 0, base[0:2]=0 */
         off = cl_u8(off, 0x00);                 /* base bits1-8 = 0 */
-        off = cl_u8(off, (uint8_t)((rt_stride & 0x3Fu) << 2));
-        off = cl_u8(off, (uint8_t)(((rt_stride >> 6) & 0x01u) | (8u << 3)));
-        off = cl_u32le(off, c565);              /* clear color low 32 */
+        off = cl_u8(off, (uint8_t)((rt_stride_m1 & 0x3Fu) << 2));
+        off = cl_u8(off, (uint8_t)(((rt_stride_m1 >> 6) & 0x01u) | (8u << 3)));
+        off = cl_u32le(off, c32);               /* clear color low 32（RGBA8888） */
     }
 
     /* TILE_RENDERING_MODE_CFG_ZS_CLEAR_VALUES (sub_id 1): z=1.0, stencil=0 */
@@ -519,54 +754,163 @@ static uint32_t build_clear_rcl(uint32_t fb_iova, uint32_t stride_bytes,
     off = cl_u8(off, 0x00);
     off = cl_u32le(off, 0x3F800000u);           /* z = 1.0f */
     off = cl_u16le(off, 0x0000);
+    return off;
+}
 
-    /* initial TLB clear: global, 2 iterations (GFXH-1742 workaround) */
-    for (i = 0; i < 2; i++) {
+/* tile 列表基础设施：0x7E TILE_LIST_INITIAL_BLOCK_SIZE +
+ * 0x7B MULTICORE_RENDERING_TILE_LIST_SET_BASE（binner 写的 tile 池）+
+ * 0x7A MULTICORE_RENDERING_SUPERTILE_CFG。
+ *
+ * 【必须在第一条 TILE_COORDINATES(0x7C) 之前】0x7C 让 CLE 进入「tile 扫描」
+ * 状态，这时 tile 列表基址 / 首块大小 / supertile 几何必须已经合法。缺这
+ * 三个包的 CL 在 0x7C 处直接停住、一个字节都不消费（实测 ct1ca +0、
+ * ct1cs 0x30）。build_clear_rcl 原来就缺这块（draw 路径有），这是清屏从
+ * 来没跑通过的直接原因。
+ *
+ * 顺序照 mesa v3dx_rcl.c:576-617 / 928-932：0x7E 在 RT/ZS 配置之后，
+ * 0x7B 在 0x7A 之前。fw/fh 返回 supertile 网格，调用方据此发 0x17。 */
+static uint32_t rcl_emit_tile_list_cfg(uint32_t off, uint32_t tx, uint32_t ty,
+                                       uint32_t pool_iova, uint32_t mask,
+                                       uint32_t *sup_fw, uint32_t *sup_fh)
+{
+    uint32_t sw = 1, sh = 1, fw, fh;
+
+    for (;;) {
+        fw = (tx + sw - 1u) / sw;
+        fh = (ty + sh - 1u) / sh;
+        if (fw < 256u && fh < 256u && fw * fh <= 256u)
+            break;
+        if (sw < sh)
+            sw++;
+        else
+            sh++;
+    }
+
+    /* mask: bit0 = 0x7E，bit1 = 0x7A，bit2 = 0x7B。
+     * 正常路径传 7；探针用它逐个单独发，定位到底是哪个包让 CT1 不启动。 */
+    if (mask & 1u) {
+        /* auto-chain(bit2) + 首块 128B（枚举 1）。必须与 binner 的
+         * tile_allocation_initial_block_size 一致，否则 CLE 按错的块大小
+         * 遍历 binner 写出的 tile 描述。 */
+        off = cl_u8(off, 0x7E);
+        off = cl_u8(off, (1u << 2) | 1u);
+    }
+    if (mask & 4u) {
+        /* tile 池基址（binner 的 CT0QMA） */
+        off = cl_u8(off, 0x7B);
+        off = cl_u32le(off, pool_iova);
+    }
+    if (mask & 2u) {
+        /* supertile 几何 + 整帧 tile 数 + bin tile list 数(1) + 单核 */
+        off = cl_u8(off, 0x7A);
+        off = cl_u8(off, (uint8_t)(sw - 1u));
+        off = cl_u8(off, (uint8_t)(sh - 1u));
+        off = cl_u8(off, (uint8_t)fw);
+        off = cl_u8(off, (uint8_t)fh);
+        off = cl_u8(off, (uint8_t)(tx & 0xFFu));
+        off = cl_u8(off, (uint8_t)(((ty & 0x0Fu) << 4) | ((tx >> 8) & 0x0Fu)));
+        off = cl_u8(off, (uint8_t)((ty >> 4) & 0xFFu));
+        off = cl_u8(off, 0x00);             /* nblists-1=0, multicore off */
+    }
+
+    if (sup_fw) *sup_fw = fw;
+    if (sup_fh) *sup_fh = fh;
+    return off;
+}
+
+/* STORE_TILE_BUFFER_GENERAL（13 字节，v71 包布局见 Mesa pack 头）。
+ * buffer: 0 = RASTER(RT0)，8 = NONE（dummy，不写显存）。
+ * imgfmt: V3D_3D_FMT_*；stride 是屏幕行距（字节）；addr 是图像基址。
+ * 每个 tile 的 STORE 都写同一个基址，硬件用 TILE_COORDINATES + stride
+ * 自己算出该 tile 在图像里的位置。 */
+static uint32_t rcl_emit_store(uint32_t off, uint32_t buffer, uint32_t imgfmt,
+                               int rb_swap, uint32_t stride, uint32_t addr)
+{
+    off = cl_u8(off, 0x1D);                     /* STORE_TILE_BUFFER_GENERAL */
+    off = cl_u8(off, (uint8_t)(buffer & 0x0Fu));
+    off = cl_u8(off, (uint8_t)((imgfmt & 0x0Fu) << 4));
+    off = cl_u8(off, (uint8_t)((rb_swap ? 0x10u : 0u) |
+                               ((imgfmt >> 4) & 0x03u)));
+    off = cl_u8(off, (uint8_t)((stride & 0x0Fu) << 4));
+    off = cl_u8(off, (uint8_t)((stride >> 4) & 0xFFu));
+    off = cl_u8(off, (uint8_t)((stride >> 12) & 0xFFu));
+    off = cl_u16le(off, 0x00);                  /* height（mip 层用，0） */
+    off = cl_u32le(off, addr);
+    return off;
+}
+
+/* dummy STORE：buffer_to_store = NONE(8)，不产生任何写，只用来把 TLB 的
+ * 内部 type/size 变更和后续 QPU/TLB 操作隔开（GFXH-1742）。 */
+static uint32_t rcl_emit_store_none(uint32_t off)
+{
+    return rcl_emit_store(off, 8u, 0u, 0, 0u, 0u);
+}
+
+/*
+ * clear RCL —— 【照 videocore7-exps v3d_build_clear_rcl() 的真机验证配方】
+ *
+ * 关键点：**不使用** tile-list 基础设施（0x7E / 0x7B / 0x7A）、
+ * 不使用 generic sub-list（0x14/0x15/0x7D/0x17），而是用 0x7C
+ * TILE_COORDINATES 显式遍历每一个 tile。参考仓库就是在 Pi5 上这样
+ * 连续跑通 64x64、640x480、显示 BGR565 三次 clear 的；它的 RCL 里
+ * 明确注释「no tile-list machinery ... the explicit per-tile
+ * TILE_COORDINATES below drive the render without reading the binner's
+ * tile lists, which are garbage for an empty frame」。
+ *
+ * 640x480 用 16px tile 正好是 40x30=1200 个整 tile（无残边），CL 约
+ * 23KB，仍在 64KB 的 V3D_3D_CL_MAX 内。之前用 64px tile 时 480 不是
+ * 64 的整数倍，最后一个 tile 是残 tile，属于未验证变量。
+ */
+static uint32_t build_clear_rcl(uint32_t fb_iova, uint32_t stride_bytes,
+                                uint32_t w, uint32_t h, uint32_t tile,
+                                uint32_t fmt, uint32_t rgba8, int rb_swap)
+{
+    const uint32_t log2t = 1;       /* 16px tile（Mesa: 16px -> 1） */
+    uint32_t off = 0;
+    uint32_t tx = (w + tile - 1u) / tile;
+    uint32_t ty = (h + tile - 1u) / tile;
+    uint32_t x, y, i;
+
+    /* 本配方只对 16px tile 验证过；调用方传别的尺寸时直接按 16px 算。 */
+    tile = 16u;
+    tx = (w + tile - 1u) / tile;
+    ty = (h + tile - 1u) / tile;
+
+    off = rcl_cfg_prefix(off, w, h, fmt, rgba8, log2t);
+
+    /* initial TLB clear：2 轮（GFXH-1742 workaround）。
+     * 两轮都发 0x7C(0,0) + END_OF_LOADS + dummy STORE，
+     * CLEAR_RENDER_TARGETS 只在第一轮发（mesa 对非 double-buffer 的条件）。 */
+    for (i = 0; i < 2u; i++) {
         off = cl_u8(off, 0x7C);                 /* TILE_COORDINATES (0,0) */
         off = cl_u8(off, 0x00);
         off = cl_u8(off, 0x00);
         off = cl_u8(off, 0x00);
         off = cl_u8(off, 0x1A);                 /* END_OF_LOADS */
-        off = cl_u8(off, 0x1D);                 /* STORE dummy (NONE) */
-        off = cl_u8(off, 0x08);
-        off = cl_u8(off, 0x00);
-        off = cl_u8(off, 0x00);
-        off = cl_u8(off, 0x00);
-        off = cl_u8(off, 0x00);
-        off = cl_u8(off, 0x00);
-        off = cl_u16le(off, 0x00);
-        off = cl_u32le(off, 0x00);
-        off = cl_u8(off, 0x19);                 /* CLEAR_RENDER_TARGETS */
+        off = rcl_emit_store_none(off);
+        if (i == 0)
+            off = cl_u8(off, 0x19);             /* CLEAR_RENDER_TARGETS */
         off = cl_u8(off, 0x1B);                 /* END_OF_TILE_MARKER */
     }
 
     off = cl_u8(off, 0x13);                     /* FLUSH_VCD_CACHE */
 
-    /* per-tile store of the (cleared) tile buffer to the framebuffer */
+    /* 显式逐 tile：坐标 -> 结束 load 模式 -> STORE 到 FB -> tile 结束 */
     for (y = 0; y < ty; y++) {
         for (x = 0; x < tx; x++) {
             off = cl_u8(off, 0x7C);             /* TILE_COORDINATES */
-            off = cl_u8(off, (uint8_t)(x & 0xFF));
-            off = cl_u8(off, (uint8_t)(((y & 0x0F) << 4) | ((x >> 8) & 0x0F)));
-            off = cl_u8(off, (uint8_t)((y >> 4) & 0xFF));
+            off = cl_u8(off, (uint8_t)(x & 0xFFu));
+            off = cl_u8(off, (uint8_t)(((y & 0x0Fu) << 4) |
+                                       ((x >> 8) & 0x0Fu)));
+            off = cl_u8(off, (uint8_t)((y >> 4) & 0xFFu));
             off = cl_u8(off, 0x1A);             /* END_OF_LOADS */
-            off = cl_u8(off, 0x1D);             /* STORE_TILE_BUFFER_GENERAL */
-            off = cl_u8(off, 0x00);             /* RASTER, RT0 */
-            off = cl_u8(off, (uint8_t)((fmt & 0x0F) << 4));
-            off = cl_u8(off, (uint8_t)((rb_swap ? 0x10u : 0x00u) |
-                                       ((fmt >> 4) & 0x03u)));
-            off = cl_u8(off, (uint8_t)((stride_bytes & 0x0Fu) << 4));
-            off = cl_u8(off, (uint8_t)((stride_bytes >> 4) & 0xFF));
-            off = cl_u8(off, (uint8_t)((stride_bytes >> 12) & 0xFF));
-            off = cl_u16le(off, 0);             /* height */
-            off = cl_u32le(off, fb_iova);       /* absolute address */
+            off = rcl_emit_store(off, 0u, fmt, rb_swap, stride_bytes, fb_iova);
             off = cl_u8(off, 0x1B);             /* END_OF_TILE_MARKER */
         }
     }
 
     off = cl_u8(off, 0x0D);                     /* END_OF_RENDERING */
-    /* 同 bin 侧：RFC 只在 FLUSH 命令后递增，没有它 wait_flush 永远超时 */
-    off = cl_u8(off, 0x04);                     /* FLUSH: rfc++ */
+    /* 【不要在 render CL 里发 FLUSH(0x04)】它只对 bin 线程有意义。 */
     return off;
 }
 
@@ -618,7 +962,7 @@ static uint32_t build_draw_bcl(int mode, uint32_t nverts, uint32_t sr_iova,
      * landed (bfc unmoved, no fresh ERR_STAT, no MMU fault).  Use the
      * proven-completing pairing; cl[2] keeps the 64px tile size to match
      * build_draw_rcl. */
-    off = cl_u8(off, (1u << 4) | (0u << 2));    /* block 128b, initial 64b */
+    off = cl_u8(off, (0u << 4) | (1u << 2));    /* overflow 64b, initial 128b */
     off = cl_u8(off, (uint8_t)((log2t << 3) | log2t));
     off = cl_u8(off, 0x00);
     off = cl_u8(off, 0x00);
@@ -770,6 +1114,9 @@ static uint32_t build_draw_rcl(uint32_t fb_iova, uint32_t stride_bytes,
     uint32_t tx = (w + 63) / 64;
     uint32_t ty = (h + 63) / 64;
     uint32_t i;
+    /* supertile 几何在 0x7A 里算出、在末尾的 0x17 列表里复用 */
+    uint32_t sup_w = 1, sup_h = 1, sup_fw, sup_fh;
+    uint32_t sx, sy;
 
     /* TRM_CFG_COMMON (0x79, sub 0): nrt=1, w, h, 64px tiles.  Bit 4 is
      * depth_buf_disable: it stays SET when the caller wants no depth (the
@@ -814,30 +1161,92 @@ static uint32_t build_draw_rcl(uint32_t fb_iova, uint32_t stride_bytes,
      * 64b block the binner wrote into the neighbouring tile's list and fault
      * with CTERR (ct1cs 0x218) as soon as real geometry landed in a tile. */
     off = cl_u8(off, 0x7E);
-    off = cl_u8(off, (1u << 2) | (0u << 0));
-    /* MULTICORE_RENDERING_SUPERTILE_CFG (0x7A): 1 supertile = whole frame */
-    off = cl_u8(off, 0x7A);
-    off = cl_u8(off, (uint8_t)(tx - 1));        /* supertile_w - 1 (tiles) */
-    off = cl_u8(off, (uint8_t)(ty - 1));
-    off = cl_u8(off, 1);                        /* frame w in supertiles */
-    off = cl_u8(off, 1);
-    off = cl_u8(off, (uint8_t)(tx & 0xFF));
-    off = cl_u8(off, (uint8_t)(((ty & 0x0F) << 4) | ((tx >> 8) & 0x0F)));
-    off = cl_u8(off, (uint8_t)((ty >> 4) & 0xFF));
-    off = cl_u8(off, 0x00);                     /* nblists-1 = 0 */
-    /* MULTICORE_RENDERING_TILE_LIST_SET_BASE (0x7B) -> binning pool */
+    off = cl_u8(off, (1u << 2) | (1u << 0));   /* auto-chain + 128b block */
+    /* MULTICORE_RENDERING_TILE_LIST_SET_BASE (0x7B) -> binning pool.
+     * 顺序与 mesa v3dx_rcl.c:576/580 一致：SET_BASE 在前、SUPERTILE_CFG 在后。 */
     off = cl_u8(off, 0x7B);
     off = cl_u32le(off, _pool_p);
+    /* MULTICORE_RENDERING_SUPERTILE_CFG (0x7A)
+     *
+     * 字段布局（小端 64 位参数，v3d_packet.xml code=122）：
+     *   bit0-7    supertile_width_in_tiles  - 1
+     *   bit8-15   supertile_height_in_tiles - 1
+     *   bit16-23  total_frame_width_in_supertiles
+     *   bit24-31  total_frame_height_in_supertiles
+     *   bit32-43  total_frame_width_in_tiles
+     *   bit44-55  total_frame_height_in_tiles
+     *   bit56     multicore_enable
+     *   bit60     supertile_raster_order
+     *   bit61-63  number_of_bin_tile_lists - 1
+     *
+     * 【曾经的错误】原来写的是「supertile = tx×ty（10×8）、frame = 1×1」——
+     * 把两个概念写反了。硬件 supertile 尺寸有上限，10×8 直接让 CT1 挂死
+     * （前缀探针实测：prefix 0x7A STUCK、ct1cs=0x20 不清零，且此后
+     * CT1 再也无法恢复，连 probeA 单字节 END 都失败）。
+     *
+     * mesa 的算法（v3dx_rcl.c:583-606）：从 1×1 起，若 supertile 数量
+     * 超 V3D_MAX_SUPERTILES(256) 就增长较小的一边。10×8 tiles 时
+     * 1×1 就满足（80 ≤ 256），所以 supertile=1×1、frame=10×8。 */
+    {
+        for (;;) {
+            sup_fw = (tx + sup_w - 1u) / sup_w;
+            sup_fh = (ty + sup_h - 1u) / sup_h;
+            if (sup_fw < 256u && sup_fh < 256u && sup_fw * sup_fh <= 256u) {
+                break;
+            }
+            if (sup_w < sup_h) {
+                sup_w++;
+            } else {
+                sup_h++;
+            }
+        }
+        off = cl_u8(off, 0x7A);
+        off = cl_u8(off, (uint8_t)(sup_w - 1u));/* supertile w - 1 (tiles) */
+        off = cl_u8(off, (uint8_t)(sup_h - 1u));/* supertile h - 1 (tiles) */
+        off = cl_u8(off, (uint8_t)sup_fw);      /* frame w in supertiles */
+        off = cl_u8(off, (uint8_t)sup_fh);      /* frame h in supertiles */
+        off = cl_u8(off, (uint8_t)(tx & 0xFFu));/* total frame w in tiles */
+        off = cl_u8(off, (uint8_t)(((ty & 0x0Fu) << 4) | ((tx >> 8) & 0x0Fu)));
+        off = cl_u8(off, (uint8_t)((ty >> 4) & 0xFFu));
+        off = cl_u8(off, 0x00);                 /* nblists-1=0, multicore off */
+    }
+    /* TILE_COORDINATES (0x7C, 4 字节)：告诉硬件「从 tile (0,0) 开始扫描」。
+     *
+     * 【曾经被误删】禁用 GFXH-1742 段时把这段里仅有的两个 0x7C 一起删了，
+     * 结果 CT1 不知道从哪里开始，直接挂住不动 —— 实测 ct1ca 恒为
+     * start+9（Common 末尾）、ct1cs 保持 0x20/0x60（CTRUN 不清），
+     * 且此后 CT1 完全无法恢复（连单字节 END 都跑不了）。
+     *
+     * mesa v3dx_rcl.c:620 在 MULTICORE_RENDERING_SUPERTILE_CFG 之后
+     * 立即发这条，binning 起点才确定。 */
+    off = cl_u8(off, 0x7C);                     /* TILE_COORDINATES (0,0) */
+    off = cl_u8(off, 0x00);                     /* tile column number */
+    off = cl_u8(off, 0x00);                     /* tile row number */
+    off = cl_u8(off, 0x00);                     /* 补齐到 4 字节 */
     /* initial TLB clear (2x, global, GFXH-1742 workaround): only on the first
      * dispatch of a frame, which initialises colour (RT_PART1) + Z (ZS_CLEAR)
      * for the whole frame.  Later dispatches LOAD the persisted buffers, so
      * clearing here would erase the frame accumulated so far. */
+    /* 【临时禁用 GFXH-1742 段做二分】这段是「TLB 内部 type/size 变化时
+     * QPU 拿到旧状态」的 race workaround（mesa v3dx_rcl.c:638）。实测
+     * CT 稳定停在 start+52（= 0x7C 之后 / STORE 参数中段），先确认
+     * 问题是否出在这段：禁用后若 ct1ca 越过 43，说明就是它；若仍停，
+     * 说明在更后面（gen tile list / STORE）。
+     *
+     * 权威长度（v3d_packet_v71_pack.h）：
+     *   TILE_COORDINATES            = 4  （不是 9！）
+     *   STORE_TILE_BUFFER_GENERAL   = 13
+     *   TILE_RENDERING_MODE_CFG_COMMON = 9
+     */
+#if V3D_3D_ENABLE_GFXH1742
     if (first_frame) {
         for (i = 0; i < 2; i++) {
-            off = cl_u8(off, 0x7C);             /* TILE_COORDINATES (0,0) */
-            off = cl_u8(off, 0x00);
-            off = cl_u8(off, 0x00);
-            off = cl_u8(off, 0x00);
+            if (i > 0) {
+                off = cl_u8(off, 0x7C);         /* TILE_COORDINATES (0,0) */
+                off = cl_u8(off, 0x00);         /* tile column (12 bit) */
+                off = cl_u8(off, 0x00);         /* tile row (12 bit) */
+                off = cl_u8(off, 0x00);         /* 共 4 字节 */
+            }
             off = cl_u8(off, 0x1A);             /* END_OF_LOADS */
             off = cl_u8(off, 0x1D);             /* STORE dummy (NONE) */
             off = cl_u8(off, 0x08);
@@ -848,10 +1257,13 @@ static uint32_t build_draw_rcl(uint32_t fb_iova, uint32_t stride_bytes,
             off = cl_u8(off, 0x00);
             off = cl_u16le(off, 0x00);
             off = cl_u32le(off, 0x00);
-            off = cl_u8(off, 0x19);             /* CLEAR_RENDER_TARGETS */
+            if (i == 0)                         /* 同 build_clear_rcl：
+                                                 * mesa 只在 i==0 清 */
+                off = cl_u8(off, 0x19);         /* CLEAR_RENDER_TARGETS */
             off = cl_u8(off, 0x1B);             /* END_OF_TILE_MARKER */
         }
     }
+#endif /* V3D_3D_ENABLE_GFXH1742 */
     off = cl_u8(off, 0x13);                     /* FLUSH_VCD_CACHE */
     /* generic tile list built directly into _gen (the cl_* helpers write
      * into _cl and would clobber the RCL being assembled there). */
@@ -859,6 +1271,21 @@ static uint32_t build_draw_rcl(uint32_t fb_iova, uint32_t stride_bytes,
         uint8_t *gp = _gen_va;
         uint32_t g = 0;
         int zpersist = (depth_en && z_iova != 0);
+        /* 【开头必须是 0x7D TILE_COORDINATES_IMPLICIT，中段才是 0x15】
+         * mesa v3dx_rcl.c:344-385 的 generic per-tile list 顺序是：
+         *   0x7D TILE_COORDINATES_IMPLICIT   ← 取本 tile 的坐标，开启一个 tile
+         *   [LOAD_TILE_BUFFER_GENERAL ...]   ← 需要 load 的缓冲
+         *   0x1A END_OF_LOADS                ← 切 load 模式 -> render 模式
+         *   0x38 PRIM_LIST_FORMAT
+         *   0x36 SET_INSTANCEID
+         *   0x15 BRANCH_TO_IMPLICIT_TILE_LIST ← 执行 binner 写好的本 tile 图元
+         *   [STORE_TILE_BUFFER_GENERAL ...]
+         *   0x1B END_OF_TILE_MARKER
+         *   0x12 RETURN_FROM_SUB_LIST
+         * 之前把开头的 0x7D 换成了 0x15（理由写在旧注释里），结果整个
+         * tile 循环没有「开始一个新 tile」的命令，CT 执行完主 CL 的 0x14
+         * 之后就没有合法入口（ct1ca 恒在 0x14 处、CTRUN 不清）。0x15 只
+         * 该出现在中段那一个位置。 */
         gp[g++] = 0x7D;                         /* TILE_COORDINATES_IMPLICIT */
         if (!first_frame) {
             /* later dispatch of the frame: reload the persisted colour (+Z)
@@ -893,13 +1320,30 @@ static uint32_t build_draw_rcl(uint32_t fb_iova, uint32_t stride_bytes,
                                 z_stride, z_iova);               /* STORE Z */
         gp[g++] = 0x1B;                         /* END_OF_TILE_MARKER */
         gp[g++] = 0x12;                         /* RETURN_FROM_SUB_LIST */
+        /* 【必须 clean】generic tile list 也是 CPU 写的 GPU 数据。
+         * 之前漏了这一步：CL 主体 clean 了（所以 0x14 之前的命令都能
+         * 执行），但 _gen 里的内容停在 CPU cache，GPU 从 0x4b064000
+         * 读到全 0 → CT 执行完 0x14（Start Address of Generic Tile
+         * List）之后就等着，永远等不到合法命令
+         * （实测 ct1ca 恒等于 0x14 命令末尾、ct1cs 带 CTRUN）。 */
+        dma_clean(_gen_p, g);
         off = cl_u8(off, 0x14);                 /* START_ADDRESS_OF_GENERIC_TILE_LIST */
         off = cl_u32le(off, _gen_p);
         off = cl_u32le(off, _gen_p + g);
     }
-    off = cl_u8(off, 0x17);                     /* SUPERTILE_COORDINATES (0,0) */
-    off = cl_u8(off, 0x00);
-    off = cl_u8(off, 0x00);
+    /* SUPERTILE_COORDINATES：这条命令的含义是「本 supertile 有内容，按它
+     * 的 tile list 执行上面 0x14 指向的 generic list」。mesa 对每个和
+     * scissor 相交的 supertile 发一条（v3dx_rcl.c:686-697）。
+     * 这里原来只发 (0,0)：640x480 / 64px tile 是 10x8 个 tile、supertile
+     * 1x1，所以只有左上角那一个 tile 会被渲染，其余 79 个永远不画。全帧
+     * 覆盖就按 supertile 网格全发（scissor 剔除以后再做）。 */
+    for (sy = 0; sy < sup_fh; sy++) {
+        for (sx = 0; sx < sup_fw; sx++) {
+            off = cl_u8(off, 0x17);             /* SUPERTILE_COORDINATES */
+            off = cl_u8(off, (uint8_t)sx);
+            off = cl_u8(off, (uint8_t)sy);
+        }
+    }
     off = cl_u8(off, 0x0D);                     /* END_OF_RENDERING */
     return off;
 }
@@ -941,7 +1385,8 @@ int v3d_3d_submit_cl(uint32_t bcl_start, uint32_t bcl_end,
   v3d_g2d_l2_invalidate_all();
   core[CLE_CT0QBA / 4] = bcl_start;
   core[CLE_CT0QEA / 4] = bcl_end;
-  rcb = wait_flush(core, CLE_BFC, bfc0);
+  rcb = wait_flush(core, V3D_INT_FLDONE, CLE_BFC, bfc0, CLE_CT0CS,
+                   CLE_CT0CA, bcl_end);
   if (rcb != 0) {
     slog("v3d_3d: submit_cl BIN timeout bfc %u->%u ct0ca 0x%x ct0cs 0x%x\r\n",
          bfc0, core[CLE_BFC / 4], core[CLE_CT0CA / 4],
@@ -955,7 +1400,8 @@ int v3d_3d_submit_cl(uint32_t bcl_start, uint32_t bcl_end,
   v3d_g2d_l2_invalidate_all();
   core[CLE_CT1QBA / 4] = rcl_start;
   core[CLE_CT1QEA / 4] = rcl_end;
-  rcr = wait_flush(core, CLE_RFC, rfc0);
+  rcr = wait_flush(core, V3D_INT_FRDONE, CLE_RFC, rfc0, CLE_CT1CS,
+                   CLE_CT1CA, rcl_end);
   if (rcr != 0) {
     slog("v3d_3d: submit_cl RENDER timeout rfc %u->%u ct1ca 0x%x ct1cs 0x%x\r\n",
          rfc0, core[CLE_RFC / 4], core[CLE_CT1CA / 4],
@@ -970,6 +1416,81 @@ static void stalled(const char *why)
 {
     slog("v3d_3d: %s on job: %s\r\n", why, _job_desc);
     v3d_g2d_recover(why);
+}
+
+/* 【CL 前缀二分探针】把 render CL 按命令边界逐步截断后提交，
+ * 看从哪一条开始 CT 的 CTRUN 不再清零。
+ *
+ * 命令边界来自 CL dump 实测（triangle 路径）：
+ *   9=Common 18=RT_PART1 27=sub_id1 29=0x7E 38=0x7A
+ *   43=0x7B 44=FLUSH_VCD 53=START_GENERIC_TILE_LIST 57=END
+ *
+ * 每个前缀只等 ~0.3s（不等完整超时），避免整轮太慢。 */
+int v3d_3d_probe_prefix(void)
+{
+    /* 用「功能单元」而不是「单条命令」作边界：0x7B(tile list base) 和
+     * 0x7A(supertile cfg) 必须成对出现，单独截断到 0x7B 会让硬件缺
+     * supertile 配置而假性卡住（上一轮 prefix 0x7B STUCK 即是此假象）。
+     *
+     * 边界（build_draw_rcl 发射顺序）：
+     *   Common(9) RT1(18) sub1(27) 0x7E(29) [0x7B+0x7A](43) 0x7C(47)
+     *   0x13(48) 0x14(57) 0x17(60) END(61) */
+    static const uint32_t bounds[] = {9, 18, 27, 29, 47, 48, 57, 61};
+    static const char *names[] = {
+        "Common", "RT1", "sub1", "0x7E", "7B+7A+7C", "0x13", "0x14", "END"};
+    volatile uint32_t *core;
+    uint32_t len;
+
+    if (!_ready) {
+        return V3D_3D_UNSUPPORTED;
+    }
+    core = v3d_g2d_core_regs();
+    if (core == NULL) {
+        return V3D_3D_FAILED;
+    }
+
+    /* 用 triangle 的 render CL（有真图元）作为基准 */
+    len = build_draw_rcl(0x3f800000u /* FB_GVA */, 2u * 640u /* stride */,
+                         V3D_3D_FMT_BGR565, 0 /* rgba8 */, 0 /* rb_swap */,
+                         640, 480, 0 /* depth_en */, 0 /* z_iova */,
+                         0 /* z_stride */, 1 /* first_frame */, 0.0f,
+                         1 /* mode: triangles */);
+    if (len < bounds[sizeof(bounds) / sizeof(bounds[0]) - 1]) {
+        slog("v3d_3d: probe_prefix CL too short (%u)\r\n", len);
+        return V3D_3D_FAILED;
+    }
+    dma_clean(_cl_p, len);
+
+    v3d_g2d_op_begin();
+    for (uint32_t i = 0; i < sizeof(bounds) / sizeof(bounds[0]); i++) {
+        uint32_t off = bounds[i];
+        if (off > len) {
+            break;
+        }
+        core[CLE_CT1CS / 4] = 0;
+        __asm__ __volatile__("dsb sy" ::: "memory");
+        core[CLE_CT1QBA / 4] = _cl_p;
+        core[CLE_CT1QEA / 4] = _cl_p + off;
+
+        /* 短等待：CTRUN 清零即通过 */
+        int done = 0;
+        for (uint32_t k = 0; k < 600000u; k++) {
+            if (k > CT_DONE_STARTUP_SPIN && (core[CLE_CT1CS / 4] & 0x20u) == 0) {
+                done = 1;
+                break;
+            }
+            __asm__ __volatile__("yield");
+        }
+        slog("v3d_3d: prefix %-6s(%2u) %s ct1cs=0x%02x ct1ca=+%u\r\n",
+             names[i], off, done ? "OK  " : "STUCK",
+             core[CLE_CT1CS / 4], core[CLE_CT1CA / 4] - _cl_p);
+        if (!done) {
+            /* CT0/CT1 卡住后复位，后面的前缀才有意义 */
+            v3d_g2d_recover("prefix stuck");
+        }
+    }
+    v3d_g2d_op_end();
+    return V3D_3D_DONE;
 }
 
 static void gen_emit_store_load(uint8_t *gp, uint32_t *g, uint8_t opcode,
@@ -1049,9 +1570,31 @@ int v3d_3d_init(void) {
   }
   __asm__ __volatile__("dsb sy" ::: "memory");
 
+  _ct1_wedged = 0;
+  {
+    volatile uint32_t *c = v3d_g2d_core_regs();
+    if (c != NULL) {
+      _qcfg_init = c[CLE_CT1QCFG / 4];
+#if V3D_3D_ENABLE_CLE_IRQ
+      /* 照 Linux v3d_irq_enable()（v3d_irq.c:303-321）：
+       *   先清挂起 -> 全屏蔽 -> 只解屏蔽关心的位
+       * 寄存器语义：MSK 位 1 = masked，所以 MSK_SET 写 ~IRQS、MSK_CLR 写 IRQS。
+       * 不解屏蔽时 FRDONE/FLDONE 的完成事件不会被硬件上报，job 永远不 retire
+       * ——这是「RFC 恒 0、连续 3~4 次后不再取 job」的唯一还没验证过的解释。 */
+      c[V3D_INT_CLR / 4] = CLE_IRQS;
+      __asm__ __volatile__("dsb sy" ::: "memory");
+      c[CLE_INT_MSK_SET / 4] = ~CLE_IRQS;
+      __asm__ __volatile__("dsb sy" ::: "memory");
+      c[CLE_INT_MSK_CLR / 4] = CLE_IRQS;
+      __asm__ __volatile__("dsb sy" ::: "memory");
+      printf("v3d_3d: irq unmask fdone|frdone -> msk_sts 0x%x\n",
+             c[CLE_INT_MSK_STS / 4]);
+#endif
+    }
+  }
   _ready = 1;
-  printf("v3d_3d: ready (cl=%u pool=%u tsda=%u shader=%u)\n",
-         _cl_p, _pool_p, _tsda_p, _shaders_p);
+  printf("v3d_3d: ready (cl=%u pool=%u tsda=%u shader=%u) qcfg_init=0x%x\n",
+         _cl_p, _pool_p, _tsda_p, _shaders_p, _qcfg_init);
   return 0;
 }
 
@@ -1110,37 +1653,256 @@ int v3d_3d_probe_rcl(void) {
     return V3D_3D_FAILED;
   }
 
-  /* ---- A: 单字节 END_OF_RENDERING ---- */
-  off = 0;
-  off = cl_u8(off, 0x0D);
-  dma_clean(_cl_p, off);
-  rc = submit_render(core, _cl_p, _cl_p + off);
-  printf("v3d_3d: probeA [END] rc=%d consumed=%u ct1cs=0x%x\r\n", rc,
-         core[CLE_CT1CA / 4] - _cl_p, core[CLE_CT1CS / 4]);
+  /* render 探针放在 _cl 的下一页，避开 empty-bin 刚取指过的 cache line；
+   * 同时把该页清成 0（Halt），防止 QEA 之外残留 bin 包被误读。 */
+  {
+    const uint32_t probe_off = 4096u;
+    uint32_t base = _cl_p + probe_off;
 
-  /* ---- B: 0x79 Common，9 字节 ---- */
-  off = 0;
-  off = cl_u8(off, 0x79);
-  off = cl_u8(off, 0x00);
-  off = cl_u16le(off, 640);
-  off = cl_u16le(off, 480);
-  off = cl_u8(off, (1u << 6) | (1u << 4));
-  off = cl_u8(off, (uint8_t)((1u << 7) | (log2t << 4)));
-  off = cl_u8(off, (uint8_t)((log2t >> 1) & 0x3u));
-  dma_clean(_cl_p, off);
-  rc = submit_render(core, _cl_p, _cl_p + off);
-  printf("v3d_3d: probeB [Common] rc=%d consumed=%u ct1cs=0x%x\r\n", rc,
-         core[CLE_CT1CA / 4] - _cl_p, core[CLE_CT1CS / 4]);
+    memset(_cl_va + probe_off, 0, 256u);
 
-  /* ---- C: B + END_OF_RENDERING ---- */
-  off = cl_u8(off, 0x0D);
-  dma_clean(_cl_p, off);
-  rc = submit_render(core, _cl_p, _cl_p + off);
-  printf("v3d_3d: probeC [Common+END] rc=%d consumed=%u ct1cs=0x%x\r\n", rc,
-         core[CLE_CT1CA / 4] - _cl_p, core[CLE_CT1CS / 4]);
+    /* ---- A: 单字节 END_OF_RENDERING ---- */
+    off = probe_off;
+    off = cl_u8(off, 0x0D);                     /* END_OF_RENDERING */
+    dma_clean(base, off - probe_off);
+    rc = submit_render(core, base, _cl_p + off);
+    printf("v3d_3d: probeA [END] rc=%d consumed=%u ct1cs=0x%x\r\n", rc,
+           core[CLE_CT1CA / 4] - base, core[CLE_CT1CS / 4]);
+
+    /* ---- B: 0x79 Common + END_OF_RENDERING ---- */
+    memset(_cl_va + probe_off, 0, 256u);
+    off = probe_off;
+    off = cl_u8(off, 0x79);
+    off = cl_u8(off, 0x00);
+    off = cl_u16le(off, 640);
+    off = cl_u16le(off, 480);
+    off = cl_u8(off, (1u << 6) | (1u << 4));
+    off = cl_u8(off, (uint8_t)((1u << 7) | (log2t << 4)));
+    off = cl_u8(off, (uint8_t)((log2t >> 1) & 0x3u));
+    off = cl_u8(off, 0x0D);                     /* END_OF_RENDERING */
+    dma_clean(base, off - probe_off);
+    rc = submit_render(core, base, _cl_p + off);
+    printf("v3d_3d: probeB [Common+END] rc=%d consumed=%u ct1cs=0x%x\r\n",
+           rc, core[CLE_CT1CA / 4] - base, core[CLE_CT1CS / 4]);
+
+    /* ---- C: 同一个 CL 再发一次（验证 retire 后能立刻重发） ---- */
+    dma_clean(base, off - probe_off);
+    rc = submit_render(core, base, _cl_p + off);
+    printf("v3d_3d: probeC [repeat] rc=%d consumed=%u ct1cs=0x%x\r\n", rc,
+           core[CLE_CT1CA / 4] - base, core[CLE_CT1CS / 4]);
+  }
 
   v3d_g2d_op_end();
   return rc;
+}
+
+/* ============ clear RCL 前缀梯度探针 ============
+ * CT1 卡死后无法恢复，所以一次启动只能拿到「第一个失败点」。这里按命令
+ * 边界把 clear 的 RCL 逐级加长，每级都以 END_OF_RENDERING 收尾，一次启动
+ * 一路跑下去：第一级挂住就是答案，后面的级因为 _ct1_wedged 会立刻跳过，
+ * 不会白等满超时，也不会把残值当成新证据。
+ *
+ * 级别（都是「前导配置 + 逐级追加」）：
+ *   0 配置                  Common + RT_PART1 + ZS_CLEAR
+ *   1 +TILE_COORDINATES
+ *   2 +END_OF_LOADS
+ *   3 +STORE(NONE)
+ *   4 +CLEAR_RENDER_TARGETS
+ *   5 +END_OF_TILE_MARKER
+ *   6 +第二轮 (7C/1A/STORE/1B)
+ *   7 +FLUSH_VCD_CACHE
+ *   8 +tile(0,0) 的真实 STORE
+ *   9 完整 CL（= build_clear_rcl，含全部 tile）
+ *
+ * 判读：
+ *   0/1 挂 → 渲染目标配置本身不合法（stride/type/bpp/尺寸）
+ *   2/3 挂 → END_OF_LOADS 的 load->render 切换 或 STORE 的 TLB 操作
+ *   4/5 挂 → CLEAR_RENDER_TARGETS 或 tile 结束握手
+ *   6   挂 → 在同一个 tile 上重开一轮
+ *   7/8/9 挂 → 真实地址的 STORE / tile 遍历 */
+int v3d_3d_probe_clear_steps(uint32_t fb_iova, uint32_t stride_bytes,
+                             uint32_t fmt, uint32_t w, uint32_t h,
+                             uint32_t rgba8)
+{
+    static const char *names[] = {
+        "cfg only",
+        "+0x7E init block",
+        "+0x7A supertile cfg",
+        "+0x7E+0x7A",
+        "+0x7B list base",
+        "7E+7B+7A",
+        "+TILE_COORDINATES",
+        "+END_OF_LOADS",
+        "+STORE(NONE)",
+        "+CLEAR_RENDER_TARGETS",
+        "+END_OF_TILE_MARKER",
+        "+iter2 7C/1A/ST/1B",
+        "+FLUSH_VCD_CACHE",
+        "+generic list (0x14)",
+        "+supertile coords (0x17)",
+        "full clear CL",
+    };
+    /* 前 6 级逐个试 tile 列表基础设施：bit0=0x7E bit1=0x7A bit2=0x7B。
+     * 一条都不发也能过（0 级），说明 CT1 拒绝的是某一个具体包。 */
+    static const uint32_t prefix_mask[] = {0u, 1u, 2u, 3u, 4u, 7u};
+    volatile uint32_t *core;
+    uint32_t off = 0, len = 0;
+    uint32_t tile = 64u;
+    uint32_t tx = (w + tile - 1u) / tile;
+    uint32_t ty = (h + tile - 1u) / tile;
+    uint32_t fw = 1, fh = 1;
+    int rc = 0;
+    int level;
+    int nlevel = (int)(sizeof(names) / sizeof(names[0]));
+
+    if (!_ready) {
+        return V3D_3D_UNSUPPORTED;
+    }
+    core = v3d_g2d_core_regs();
+    if (core == NULL) {
+        return V3D_3D_FAILED;
+    }
+
+    v3d_g2d_op_begin();
+
+    /* 对照实验：**轮转 CL 缓冲**。前 3 次 probe 全部从同一个 `_cl_p`
+     * 提交、只是 QEA 递增，这跟真实驱动（Linux/mesa 每次用 ring buffer
+     * 里的新位置）完全不同。
+     *
+     * 已知事实链：
+     *   - 同一个地址连续提交：第 4~5 次就会挂（两轮上限还不一样，5 次/4 次）；
+     *   - 空转 1~2 秒、清 INT_CLR、提交前写 CT1CS=0 都救不回来；
+     *   - 挂住时 qba/qea 回读等于写入值、qcfg 0x0、ct1ca 停在 QBA；
+     *   - render 完成后 int_sts 恒为 0x0（中断屏蔽下没有完成状态位），
+     *     所以「等中断」这条路也走不通。
+     *
+     * 这一轮每一级都把 CL 写到 `_cl_p + (p+1)*256` 这个**不同地址**上，
+     * QBA/QEA 随之都变。判读：
+     *   8 次全过  → 根因就是「同一 QBA 重复提交」，修复 = CL 缓冲轮转；
+     *   仍在中途挂 → 与地址无关，是真正的 job 回收问题，接着查 CT1QCFG。 */
+    {
+        int p;
+
+        for (p = 0; p < 8; p++) {
+            /* 槽位放在 _cl 缓冲靠后处，避开 build_clear_rcl 用的 _cl_va 头部 */
+            uint32_t slot = _cl_p + 4096u + (uint32_t)p * 1024u;
+
+            /* 【必须用完整 CL】残缺 CL（只有 Common+END，没有任何
+             * supertile 工作）大概永远不会产生 FRDONE —— 硬件认为没有
+             * tile 要画，job 不算"完成"，于是 CTRUN 清零但 job 不退役。
+             * 用 build_clear_rcl 的完整 CL（含 0x14 子列表 + 0x17
+             * supertile）才可能走中断判据。 */
+            len = build_clear_rcl(fb_iova, stride_bytes, w, h, tile, fmt,
+                                  rgba8, 0);
+            if (len == 0 || len > 1024u) {
+                slog("v3d_3d: clstep pre%d bad clear CL len %u\r\n", p, len);
+                break;
+            }
+            memcpy(v3d_dma_cpu(slot), _cl_va, len);
+            dma_clean(slot, len);
+            rc = submit_render_ex(core, slot, slot + len, 0u, 0);
+            slog("v3d_3d: clstep pre%d full-clear slot+%u len=%u rc=%d ct1ca +%d/%u ct1cs 0x%x spin 0x%x\r\n",
+                 p, 4096u + (uint32_t)p * 1024u, len, rc,
+                 (int)(core[CLE_CT1CA / 4] - slot), len,
+                 core[CLE_CT1CS / 4], _last_spins);
+            if (rc != 0) {
+                v3d_g2d_op_end();
+                return rc;
+            }
+        }
+    }
+
+    for (level = 0; level < nlevel; level++) {
+        if (level == nlevel - 1) {
+            len = build_clear_rcl(fb_iova, stride_bytes, w, h, tile, fmt,
+                                  rgba8, 0);
+        } else {
+            uint32_t mask = (level < 6) ? prefix_mask[level] : 7u;
+
+            off = 0;
+            off = rcl_cfg_prefix(off, w, h, fmt, rgba8, 3u);
+            if (mask != 0u)
+                off = rcl_emit_tile_list_cfg(off, tx, ty, _pool_p, mask,
+                                             &fw, &fh);
+            if (level >= 6) {
+                off = cl_u8(off, 0x7C);         /* TILE_COORDINATES (0,0) */
+                off = cl_u8(off, 0x00);
+                off = cl_u8(off, 0x00);
+                off = cl_u8(off, 0x00);
+            }
+            if (level >= 7)
+                off = cl_u8(off, 0x1A);         /* END_OF_LOADS */
+            if (level >= 8)
+                off = rcl_emit_store_none(off); /* STORE (NONE) */
+            if (level >= 9)
+                off = cl_u8(off, 0x19);         /* CLEAR_RENDER_TARGETS */
+            if (level >= 10)
+                off = cl_u8(off, 0x1B);         /* END_OF_TILE_MARKER */
+            if (level >= 11) {                  /* 第二轮：重开同一个 tile */
+                off = cl_u8(off, 0x7C);
+                off = cl_u8(off, 0x00);
+                off = cl_u8(off, 0x00);
+                off = cl_u8(off, 0x00);
+                off = cl_u8(off, 0x1A);
+                off = rcl_emit_store_none(off);
+                off = cl_u8(off, 0x1B);
+            }
+            if (level >= 12)
+                off = cl_u8(off, 0x13);         /* FLUSH_VCD_CACHE */
+            if (level >= 13) {                  /* generic per-tile 子列表 */
+                uint8_t *gp = _gen_va;
+                uint32_t g = 0;
+
+                gp[g++] = 0x7D;                 /* TILE_COORDINATES_IMPLICIT */
+                gp[g++] = 0x1A;                 /* END_OF_LOADS */
+                gp[g++] = 0x38;                 /* PRIM_LIST_FORMAT */
+                gp[g++] = 0x02;                 /* List Triangles */
+                gp[g++] = 0x36;                 /* SET_INSTANCEID (5 字节) */
+                gp[g++] = 0x00;
+                gp[g++] = 0x00;
+                gp[g++] = 0x00;
+                gp[g++] = 0x00;
+                gp[g++] = 0x15;                 /* BRANCH_TO_IMPLICIT_TILE_LIST */
+                gp[g++] = 0x00;
+                gen_emit_store_load(gp, &g, 0x1D, 0, fmt, 0, stride_bytes,
+                                    fb_iova);
+                gp[g++] = 0x19;                 /* CLEAR_RENDER_TARGETS */
+                gp[g++] = 0x1B;                 /* END_OF_TILE_MARKER */
+                gp[g++] = 0x12;                 /* RETURN_FROM_SUB_LIST */
+                dma_clean(_gen_p, g);
+                off = cl_u8(off, 0x14);         /* START_ADDRESS_OF_GENERIC_TILE_LIST */
+                off = cl_u32le(off, _gen_p);
+                off = cl_u32le(off, _gen_p + g);
+            }
+            if (level >= 14) {                  /* 逐个 supertile 驱动 */
+                uint32_t sx, sy;
+                for (sy = 0; sy < fh; sy++) {
+                    for (sx = 0; sx < fw; sx++) {
+                        off = cl_u8(off, 0x17);
+                        off = cl_u8(off, (uint8_t)sx);
+                        off = cl_u8(off, (uint8_t)sy);
+                    }
+                }
+            }
+            off = cl_u8(off, 0x0D);             /* END_OF_RENDERING */
+            len = off;
+        }
+        if (len == 0 || len > V3D_3D_CL_MAX) {
+            slog("v3d_3d: clstep %d %s bad len %u\r\n", level, names[level], len);
+            break;
+        }
+        dma_clean(_cl_p, len);
+        rc = submit_render(core, _cl_p, _cl_p + len);
+        slog("v3d_3d: clstep %d %-22s len=%u rc=%d ct1ca +%d/%u ct1cs 0x%x\r\n",
+             level, names[level], len, rc,
+             (int)(core[CLE_CT1CA / 4] - _cl_p), len,
+             core[CLE_CT1CS / 4]);
+        if (rc != 0) {
+            break;
+        }
+    }
+    v3d_g2d_op_end();
+    return rc;
 }
 
 /* 只跑 render 阶段的整屏清色，完全绕开 binner。
@@ -1169,7 +1931,7 @@ int v3d_3d_clear_min(uint32_t fb_iova, uint32_t stride_bytes, uint32_t fmt,
     int brc = run_empty_bin(core, w, h);
     printf("v3d_3d: clear: empty bin rc=%d（失败也继续测 render）\r\n", brc);
   }
-  len = build_clear_rcl(fb_iova, stride_bytes, w, h, 64u, fmt, rgba8, 0);
+  len = build_clear_rcl(fb_iova, stride_bytes, w, h, 16u, fmt, rgba8, 0);
   if (len == 0 || len > V3D_3D_CL_MAX) {
     v3d_g2d_op_end();
     return V3D_3D_FAILED;
@@ -1254,8 +2016,12 @@ int v3d_3d_draw_min(uint32_t fb_iova, uint32_t stride_bytes, uint32_t fmt,
   }
 
   /* render 阶段：逐 tile 渲染 */
+  /* 【depth_en 必须与 z_iova 一致】原来传 1（开深度测试）但 z_iova=0
+   * （没有 Z 缓冲）——硬件要跑深度测试却找不到 Z 面，会在 STORE 处挂住
+   * （实测 ct1ca 停在 STORE 参数中段、CTRUN 不清）。先按纯颜色渲染走通。 */
   len = build_draw_rcl(fb_iova, stride_bytes, fmt, clear_rgba, 0, w, h,
-                       1 /* depth test on */, 0 /* 无持久 Z */, 0,
+                       0 /* depth test off（z_iova 为 0 时必须关） */,
+                       0 /* 无持久 Z */, 0,
                        first_frame, 1.0f, (int)mode);
   if (len == 0 || len > V3D_3D_CL_MAX) {
     goto out;

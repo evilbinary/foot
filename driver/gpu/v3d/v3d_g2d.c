@@ -881,6 +881,14 @@ int v3d_g2d_phy_valid(uint32_t iova, size_t len) {
       (uint64_t)iova + len <= (uint64_t)G2D_GVA_BASE + G2D_TOTAL_BYTES) {
     return 1;
   }
+  /* dma arena：v3d_dma_alloc 返回的是 GPU VA（V3D_DMA_GVA_BASE 起），
+   * 不是物理地址——三方映射改造后这里必须查 GVA 区间（之前查 pa
+   * 区间，导致 draw_min 的顶点缓冲校验失败，三角形一直 rc=2）。 */
+  if (g_dma.inited && iova >= V3D_DMA_GVA_BASE &&
+      (uint64_t)iova + len <= (uint64_t)V3D_DMA_GVA_BASE + g_dma.size) {
+    return 1;
+  }
+  /* 兼容：老调用方仍可能传物理地址 */
   if (g_dma.inited && iova >= g_dma.pa &&
       (uint64_t)iova + len <= (uint64_t)g_dma.pa + g_dma.size) {
     return 1;

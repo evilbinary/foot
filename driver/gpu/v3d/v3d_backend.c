@@ -17,6 +17,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include "client.h"
@@ -77,6 +78,18 @@
  * 被这个开关包住了。 */
 #define G2D_SELFTEST 0
 
+/* 【3D 启动探针开关】默认 0：冷启动后的**第一次 render 提交必须是有效
+ * clear**。
+ *
+ * 历史教训：probe_rcl() 的 probeA/B/C 都是残缺 render CL（单字节 END、
+ * Common+END），它们在真机上不会产生 FRDONE/FRDone，也不会让 RFC 递增，
+ * 但 wait_flush() 的 CTRUN 兜底会返回 rc=0。结果 probe 看似“通过”，
+ * 实际已经把 CT1 的 job 槽位占住；紧接着的真实 clear 成为第 4 次提交，
+ * 入队后 CT1 一个字节都不取（ct1ca +0、ct1cs 0x30）。参考仓库的结论也
+ * 是「一个未 retire 的 render 会永久卡住 CLE，必须在 fresh boot 后第一次
+ * 就提交有效 CL」。调试探针时再手动改成 1，且每次只开一个。 */
+#define V3D_3D_STARTUP_PROBES 0
+
 /* 前置声明：自测代码里要调用这些后面才定义的 static 函数 */
 static int v3d_bo_create(void* args);
 static int v3d_bo_destroy(void* args);
@@ -105,6 +118,10 @@ int v3d_3d_submit_cl(uint32_t bcl_start, uint32_t bcl_end,
                      uint32_t rcl_start, uint32_t rcl_end, uint32_t w,
                      uint32_t h);
 int v3d_3d_probe_rcl(void);
+int v3d_3d_probe_prefix(void);
+int v3d_3d_probe_clear_steps(uint32_t fb_iova, uint32_t stride_bytes,
+                             uint32_t fmt, uint32_t w, uint32_t h,
+                             uint32_t rgba8);
 int v3d_3d_clear_min(uint32_t fb_iova, uint32_t stride_bytes, uint32_t fmt,
                      uint32_t w, uint32_t h, uint32_t rgba8);
 int v3d_3d_draw_min(uint32_t fb_iova, uint32_t stride_bytes, uint32_t fmt,
@@ -224,6 +241,38 @@ static int screen_init(void) {
   printf("v3d: screen %ux%u bpp=%u fmt=%u cpp=%u tex=%u pa=0x%08x pages=%u\n", w,
          h, bpp, fmt, cpp, tex, fb_pa, pages);
   return 0;
+}
+
+/* 【客观验收】mmap /dev/fb 读回几个像素，确认 3D clear 真的写进了显存。
+ * 远端调试看不到屏幕，必须用像素值把「rc=0」和「真的写了」区分开。
+ * 清屏区域是屏幕左上 640x480，所以 (0,0)/(320,240)/(639,479) 应该变成
+ * 纯色，而 (700,500) 在区域外，作为对照。 */
+static void fb_readback_probe(const char *tag) {
+  if (!g_screen.inited || g_screen.cpp != 2) {
+    printf("%s: readback skipped (inited=%d cpp=%u)\n", tag, g_screen.inited,
+           g_screen.cpp);
+    return;
+  }
+  int fd = open("/dev/fb", O_RDWR);
+  if (fd < 0) {
+    printf("%s: /dev/fb open failed\n", tag);
+    return;
+  }
+  size_t len = (size_t)g_screen.pitch * g_screen.height;
+  len = (len + 0xFFFu) & ~(size_t)0xFFFu;
+  void *base = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0);
+  if (base == MAP_FAILED) {
+    printf("%s: mmap(%u) failed\n", tag, (unsigned)len);
+    close(fd);
+    return;
+  }
+  const uint16_t *p16 = (const uint16_t *)base;
+  uint32_t row = g_screen.pitch / 2u;
+  printf("%s: fb16 (0,0)=0x%04x (320,240)=0x%04x (639,479)=0x%04x (700,500)=0x%04x\n",
+         tag, p16[0], p16[240u * row + 320u], p16[479u * row + 639u],
+         p16[500u * row + 700u]);
+  munmap(base, len);
+  close(fd);
 }
 
 /* 填一个矩形区域。color 按屏幕格式解释（RGB565 只取低 16 位）。 */
@@ -402,21 +451,29 @@ static int v3d_init(void) {
     uint32_t st0 = ree0 & V3D_SMS_STATE_MASK;
     int rstn0 = (pmg0 & V3D_PM_V3DRSTN) ? 1 : 0;
     int dirty = (ree0 & 0x80000000u) ? 1 : 0;
+    /* 上一次 gpud 的 render 超时会把 CT1 留在 CTRUN=1；SMS 看起来仍是
+     * IDLE，但 CLE 已经卡死。只看电源状态会错误地 skip reset，于是新
+     * 进程第一次 clear 就复现「ct1ca +4096 / ct1cs 0x70」。 */
+    uint32_t ct1cs0 = g_dev.core0[V3D_CLE_CT1CS / 4];
+    uint32_t ct1ca0 = g_dev.core0[V3D_CLE_CT1CA / 4];
+    int ct1_wedged = (ct1cs0 & V3D_CLE_CT1CS_CTRUN) ? 1 : 0;
 
-    if (rstn0 && st0 == V3D_SMS_STATE_IDLE && !dirty) {
-      printf("v3d: hw already on (ree_cs=0x%08x pm_grafx=0x%08x) "
-             "-> skip powerup/reset\n",
-             ree0, pmg0);
+    if (rstn0 && st0 == V3D_SMS_STATE_IDLE && !dirty && !ct1_wedged) {
+      printf("v3d: hw already on (ree_cs=0x%08x pm_grafx=0x%08x "
+             "ct1cs=0x%x) -> skip powerup/reset\n",
+             ree0, pmg0, ct1cs0);
     } else {
       int rc_sms = v3d_sms_powerup(&g_dev);
       int rc_pm = v3d_pm_reset(&g_dev);
       uint32_t ree = g_dev.sms[V3D_SMS_REE_CS / 4];
       uint32_t pmg = g_dev.pm[V3D_PM_GRAFX_OFF / 4];
       printf("v3d: sms rc=%d pm rc=%d ree_cs=0x%08x(state=0x%x) "
-             "pm_grafx=0x%08x rstn=%u%s\n",
+             "pm_grafx=0x%08x rstn=%u%s%s (was ct1cs=0x%x ca=0x%x)\n",
              rc_sms, rc_pm, ree, (unsigned)(ree & V3D_SMS_STATE_MASK), pmg,
              (pmg & V3D_PM_V3DRSTN) ? 1u : 0u,
-             dirty ? " [was dirty]" : "");
+             dirty ? " [was dirty]" : "",
+             ct1_wedged ? " [ct1 wedged]" : "",
+             ct1cs0, ct1ca0);
     }
   }
 
@@ -539,21 +596,43 @@ static int v3d_init(void) {
                diff, s[0], d[0]);
       }
 
-      /* 实验 0：最小 render CL（Common + END），读 CT1CA 定位 CT 消费量 */
+      /* 实验 0a：render CL 前缀二分。
+       * 【暂时关闭】它会在 CT 卡死时污染后续所有测试（recover 复位不彻底），
+       * 排查告一段落后再开。需要时把下面两行取消注释即可。 */
+      /* int pprc = v3d_3d_probe_prefix();
+         printf("v3d_3d: probe_prefix rc=%d\r\n", pprc); */
+
+#if V3D_3D_STARTUP_PROBES
+      /* 实验 0b：最小 render CL（Common + END），读 CT1CA 定位 CT 消费量。
+       * 注意：它会产生「不 retire 的 job」，之后不要再提交真实 clear。 */
       int prc0 = v3d_3d_probe_rcl();
       printf("v3d_3d: probe rc=%d\r\n", prc0);
 
-      /* 实验 1：只跑 render 的整屏清色（绕开 binner）——
-       * EwokOS 注明 clear 是该硅片上唯一被证明能跑完的路径。 */
+      /* 实验 0c：clear RCL 前缀梯度。CT1 卡死后无法恢复，所以一次启动
+       * 只能拿到「第一个挂住的命令」。 */
+      {
+        int src = v3d_3d_probe_clear_steps(FB_GVA, (uint32_t)g_screen.pitch,
+                                           V3D_3D_FMT_BGR565, 640, 480,
+                                           0xFF0000FFu);
+        printf("v3d_3d: probe_clear_steps rc=%d\n", src);
+      }
+#endif
+
+      /* 实验 1：**冷启动后第一次 render 提交就是有效 clear**。
+       * 顺序绝不能变：任何残缺 render CL（探针）先跑都会占住 CT1 的 job
+       * 槽位，让后面的真实 clear 一个字节都不被消费。 */
+      fb_readback_probe("v3d_3d: before clear");
       int crc = v3d_3d_clear_min(FB_GVA, (uint32_t)g_screen.pitch,
                                  V3D_3D_FMT_BGR565, 640, 480, 0xFF0000FFu);
       printf("v3d_3d: clear rc=%d (屏幕左上 640x480 应变纯色)\n", crc);
+      fb_readback_probe("v3d_3d: after clear");
 
       int trc = v3d_3d_draw_min(FB_GVA, (uint32_t)g_screen.pitch,
                                 V3D_3D_FMT_BGR565, 640, 480,
                                 V3D_3D_MODE_TRIANGLES, 3, vpa, vpa + 256,
                                 0xFF000000u, 1);
       printf("v3d_3d: triangle rc=%d (expect %d)\n", trc, V3D_3D_DONE);
+      fb_readback_probe("v3d_3d: after triangle");
     } else {
       printf("v3d_3d: vertex buffer alloc failed\n");
     }

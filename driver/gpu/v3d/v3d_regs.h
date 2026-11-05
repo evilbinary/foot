@@ -150,6 +150,13 @@
 #define V3D_CTL_INT_MSK_CLR 0x00064u
 #define V3D_CTL_INT_MSK_STS 0x0005cu /* 当前屏蔽状态（读回确认） */
 
+/* CLE control-thread status（core0 窗口）。CTRUN 置位表示线程还在跑；
+ * 上一次 gpud 把 CT1 卡死后，若不做 SMS/PM 复位，新进程读到的仍是
+ * CTRUN=1 + CA 停在旧 arena 页边界（典型 +4096），新 QBA/QEA 不会被取。 */
+#define V3D_CLE_CT1CS 0x00104u
+#define V3D_CLE_CT1CA 0x00114u
+#define V3D_CLE_CT1CS_CTRUN (1u << 5)
+
 /* ---- CSD（计算着色器分发，core0 窗口；V3D 7.x 偏移）----
  * 提交流程（对照 Linux drm/v3d/v3d_sched.c: v3d_csd_job_run）：
  *   写 CFG1..CFG6 → 写 CFG7（7.x 置 0）→ 最后写 CFG0 触发 job。
