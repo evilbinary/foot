@@ -41,6 +41,8 @@ enum gpu_fn_low {
   GPU_LOW_SUBMIT_CSD = 121,
   GPU_LOW_SUBMIT_TFU = 122,
   GPU_LOW_WAIT_BO = 130,
+  GPU_LOW_SCREEN_INFO = 140,
+  GPU_LOW_SCREEN_PARAM = 141,
 };
 
 /* ---- BO（GPU 内存对象）----
@@ -174,6 +176,37 @@ typedef struct {
 #define GPU_SUBMIT_CL_ABS_VA (1u << 0) /* bcl/rcl start/end 是绝对 GPU VA */
 
 
+/* 屏幕 framebuffer 信息：direct scanout 模式下应用要把这块已有显存
+ * 包成 Mesa pipe_resource，GPU 直接渲染进去，显示控制器扫同一块内存。 */
+typedef struct {
+  unsigned int gva;    /* 屏幕在 GPU MMU 里的虚拟地址 */
+  unsigned int pa;     /* 物理地址 */
+  unsigned int width;  /* 1920 */
+  unsigned int height; /* 1080 */
+  unsigned int pitch;  /* 字节/行 */
+  unsigned int cpp;    /* 2 (RGB565) */
+  unsigned int format; /* V3D_TEX_FORMAT_RGB565 = 6 */
+  unsigned int size;   /* pitch * height */
+} gpu_screen_info;
+
+/* 屏幕信息逐字段查询（client_call 只能回传一个整数） */
+enum {
+  GPU_SCREEN_PARAM_GVA = 0,
+  GPU_SCREEN_PARAM_PA = 1,
+  GPU_SCREEN_PARAM_WIDTH = 2,
+  GPU_SCREEN_PARAM_HEIGHT = 3,
+  GPU_SCREEN_PARAM_PITCH = 4,
+  GPU_SCREEN_PARAM_CPP = 5,
+  GPU_SCREEN_PARAM_FORMAT = 6,
+  GPU_SCREEN_PARAM_SIZE = 7,
+};
+
+/* present 模式参数（应用侧选择） */
+typedef enum {
+  GPU_PRESENT_MODE_TFU = 0,    /* 离屏 BO -> TFU -> 屏幕 */
+  GPU_PRESENT_MODE_DIRECT = 1  /* 直接渲染到屏幕 framebuffer */
+} gpu_present_mode_t;
+
 /* ---------------- 后端抽象 ---------------- */
 typedef struct gpu_backend {
   const char* name;     /* "v3d" */
@@ -196,6 +229,8 @@ typedef struct gpu_backend {
   int (*bo_offset)(void* args); /* handle → GPU VA */
   int (*submit_cl)(void* args);
   int (*submit_csd)(void* args);
+  int (*screen_info)(void* args); /* gpu_screen_info* */
+  int (*screen_param)(unsigned int param);
   int (*submit_tfu)(void* args);
   int (*wait_bo)(void* args);
 } gpu_backend_t;

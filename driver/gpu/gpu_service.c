@@ -56,6 +56,12 @@ static void* gpu_service_fn(void* fn, void* args) {
       return (void*)(long)(g_be->submit_csd ? g_be->submit_csd(args) : -1);
     case GPU_LOW_WAIT_BO:
       return (void*)(long)(g_be->wait_bo ? g_be->wait_bo(args) : -1);
+    case GPU_LOW_SCREEN_INFO:
+      return (void*)(long)(g_be->screen_info ? g_be->screen_info(args) : -1);
+    case GPU_LOW_SCREEN_PARAM: {
+      unsigned int param = args ? *(unsigned int*)args : 0xffffffffu;
+      return (void*)(long)(g_be->screen_param ? g_be->screen_param(param) : -1);
+    }
 
     default:
       return (void*)(long)-1;

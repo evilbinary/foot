@@ -16,6 +16,8 @@
  ********************************************************************/
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -115,8 +117,9 @@ static inline uint64_t g2d_rd_frq(void) {
 int v3d_3d_init(void);
 uint32_t v3d_3d_cl_base(void);
 int v3d_3d_submit_cl(uint32_t bcl_start, uint32_t bcl_end,
-                     uint32_t rcl_start, uint32_t rcl_end, uint32_t w,
-                     uint32_t h);
+                     uint32_t rcl_start, uint32_t rcl_end,
+                     uint32_t qma, uint32_t qms, uint32_t qts,
+                     uint32_t w, uint32_t h);
 int v3d_3d_probe_rcl(void);
 int v3d_3d_probe_prefix(void);
 int v3d_3d_probe_clear_steps(uint32_t fb_iova, uint32_t stride_bytes,
@@ -560,6 +563,17 @@ static int v3d_init(void) {
    * 只验证 CLE bin/render 这条链路能不能出像素，不做任何复杂效果。
    * 顶点格式：pos = float3(stride 12)、col = RGBA byte4(stride 4)。 */
   if (v3d_3d_init() == 0) {
+    /* Mesa 测试（app/test/test-mesa-*）不希望启动自测先占掉 CT1：
+     * 自测里的 triangle 目前还会失败并 wedge CT1。放一个
+     * /conf/v3d-skip-startup 文件即可只初始化 3D 后端，把第一次 render
+     * 留给 Mesa。不用 getenv：YiYiYa 的 libc 里 getenv 可能没有有效
+     * environ，实测一调用就挂。 */
+    int skipfd = open("/conf/v3d-skip-startup", O_RDONLY);
+    int skip3d = (skipfd >= 0);
+    if (skipfd >= 0) close(skipfd);
+    if (skip3d) {
+      printf("v3d_3d: startup 3D test skipped (sentinel)\n");
+    } else {
     /* 用 3D 的 identity DMA arena 分配：iova == pa，免手动映射 */
     uint32_t vpa = v3d_dma_alloc(4096u, 512u);
     if (vpa != 0) {
@@ -635,6 +649,7 @@ static int v3d_init(void) {
       fb_readback_probe("v3d_3d: after triangle");
     } else {
       printf("v3d_3d: vertex buffer alloc failed\n");
+    }
     }
   } else {
     printf("v3d_3d: init failed\n");
@@ -1049,6 +1064,41 @@ static int v3d_query(void* args) {
   return (int)((g_screen.width << 16) | (g_screen.height & 0xFFFF));
 }
 
+/* direct scanout：应用需要把屏幕 framebuffer 包成 Mesa resource。
+ * 这里只返回描述信息，不分配/不复制。 */
+static int v3d_screen_info(void* args) {
+  gpu_screen_info* s = (gpu_screen_info*)args;
+  if (s == NULL || !g_screen.inited) {
+    return -1;
+  }
+  s->gva = g_screen.gpu_va;
+  s->pa = g_screen.fb_pa;
+  s->width = g_screen.width;
+  s->height = g_screen.height;
+  s->pitch = g_screen.pitch;
+  s->cpp = g_screen.cpp;
+  s->format = g_screen.tex;
+  s->size = g_screen.pitch * g_screen.height;
+  return 0;
+}
+
+static int v3d_screen_param(unsigned int param) {
+  if (!g_screen.inited) {
+    return -1;
+  }
+  switch (param) {
+    case GPU_SCREEN_PARAM_GVA: return (int)g_screen.gpu_va;
+    case GPU_SCREEN_PARAM_PA: return (int)g_screen.fb_pa;
+    case GPU_SCREEN_PARAM_WIDTH: return (int)g_screen.width;
+    case GPU_SCREEN_PARAM_HEIGHT: return (int)g_screen.height;
+    case GPU_SCREEN_PARAM_PITCH: return (int)g_screen.pitch;
+    case GPU_SCREEN_PARAM_CPP: return (int)g_screen.cpp;
+    case GPU_SCREEN_PARAM_FORMAT: return (int)g_screen.tex;
+    case GPU_SCREEN_PARAM_SIZE: return (int)(g_screen.pitch * g_screen.height);
+    default: return -1;
+  }
+}
+
 static int v3d_fill(void* args) {
   gpu_fill_req* r = (gpu_fill_req*)args;
   if (r == NULL) {
@@ -1097,19 +1147,29 @@ static int v3d_bo_create(void* args) {
     return -4; /* GPU VA 区耗尽（0x30000000-0x40000000 共 256MB） */
   }
 
+  printf("v3d_bo_create: pa=0x%08x size=%u gva=0x%08x\n", r->pa, r->size,
+         gva);
+
+  /* 【批量写 PTE】逐页 v3d_mmu_map_page 每页都做一次 cache clean + dmb，
+   * 1MB 的 BO 要 300 次，客户端的 5s/60s 超时很容易被拖爆，表现为
+   * “no free slot”。这里一次写完整个 PTE 范围，只 clean 一次。 */
   volatile uint32_t* pt = (volatile uint32_t*)PT_VA;
+  uint32_t first = gva >> V3D_MMU_PAGE_SHIFT;
   uint32_t pages = r->size / V3D_MMU_PAGE_SIZE;
   for (uint32_t i = 0; i < pages; i++) {
-    v3d_mmu_map_page(pt, gva + i * V3D_MMU_PAGE_SIZE,
-                     r->pa + i * V3D_MMU_PAGE_SIZE);
+    uint32_t pa = r->pa + i * V3D_MMU_PAGE_SIZE;
+    pt[first + i] = ((pa >> V3D_MMU_PAGE_SHIFT) & V3D_PTE_PFN_MASK) |
+                    V3D_PTE_WRITEABLE | V3D_PTE_VALID;
   }
-  foot_cache_clean((void*)pt, (void*)(PT_VA + V3D_MMU_PT_BYTES));
+  __asm__ __volatile__("dmb sy" ::: "memory");
+  foot_cache_clean((void*)&pt[first], (void*)&pt[first + pages]);
   v3d_mmu_flush(&g_dev);
 
   g_bos[slot].gva = gva;
   g_bos[slot].pa = r->pa;
   g_bos[slot].size = r->size;
   g_bos[slot].in_use = 1;
+  printf("v3d_bo_create: handle=%d ok\n", slot + 1);
   return slot + 1; /* handle = slot+1（0 保留为"无"） */
 }
 
@@ -1135,7 +1195,13 @@ static int v3d_submit_cl(void* args) {
   }
 
   uint32_t bs, be, rs, re;
-  if (r->bcl_handle == 0) {
+  if (r->flags & GPU_SUBMIT_CL_ABS_VA) {
+    /* Mesa 路径：uapi 直接给绝对 GPU VA，不需要 handle+偏移换算。 */
+    bs = r->bcl_start;
+    be = r->bcl_end;
+    rs = r->rcl_start;
+    re = r->rcl_end;
+  } else if (r->bcl_handle == 0) {
     uint32_t base = v3d_3d_cl_base();
     bs = base + r->bcl_start;
     be = base + r->bcl_end;
@@ -1147,19 +1213,21 @@ static int v3d_submit_cl(void* args) {
     bs = bg + r->bcl_start;
     be = bg + r->bcl_end;
   }
-  if (r->rcl_handle == 0) {
-    uint32_t base = v3d_3d_cl_base();
-    rs = base + r->rcl_start;
-    re = base + r->rcl_end;
-  } else {
-    if (r->rcl_handle > V3D_MAX_BOS || !g_bos[r->rcl_handle - 1].in_use) {
-      return -3;
+  if (!(r->flags & GPU_SUBMIT_CL_ABS_VA)) {
+    if (r->rcl_handle == 0) {
+      uint32_t base = v3d_3d_cl_base();
+      rs = base + r->rcl_start;
+      re = base + r->rcl_end;
+    } else {
+      if (r->rcl_handle > V3D_MAX_BOS || !g_bos[r->rcl_handle - 1].in_use) {
+        return -3;
+      }
+      uint32_t rg = g_bos[r->rcl_handle - 1].gva;
+      rs = rg + r->rcl_start;
+      re = rg + r->rcl_end;
     }
-    uint32_t rg = g_bos[r->rcl_handle - 1].gva;
-    rs = rg + r->rcl_start;
-    re = rg + r->rcl_end;
   }
-  return v3d_3d_submit_cl(bs, be, rs, re, r->w, r->h);
+  return v3d_3d_submit_cl(bs, be, rs, re, r->qma, r->qms, r->qts, r->w, r->h);
 }
 
 static int v3d_bo_destroy(void* args) {
@@ -1418,5 +1486,7 @@ const gpu_backend_t v3d_backend = {
     .submit_cl = v3d_submit_cl,
     .submit_csd = NULL,
     .submit_tfu = v3d_submit_tfu,
+    .screen_info = v3d_screen_info,
+    .screen_param = v3d_screen_param,
     .wait_bo = NULL,
 };
