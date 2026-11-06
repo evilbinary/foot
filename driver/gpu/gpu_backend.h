@@ -162,8 +162,16 @@ typedef struct {
   unsigned int rcl_handle; /* render CL 所在 BO 句柄，0 = 内部 */
   unsigned int rcl_start;
   unsigned int rcl_end;
+  /* Mesa 路径：qma/qms/qts 是 Mesa 自己的 tile_alloc / tile_state BO 的
+   * GPU VA（不是 gpud 内部的 _pool_p/_tsda_p）。0 表示用内部缓冲。 */
+  unsigned int qma;
+  unsigned int qms;
+  unsigned int qts;
   unsigned int w, h;       /* 渲染目标尺寸（tile 配置用） */
+  unsigned int flags;      /* GPU_SUBMIT_CL_* */
 } gpu_submit_cl_req;
+
+#define GPU_SUBMIT_CL_ABS_VA (1u << 0) /* bcl/rcl start/end 是绝对 GPU VA */
 
 
 /* ---------------- 后端抽象 ---------------- */

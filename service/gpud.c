@@ -31,6 +31,10 @@ int main(int argc, char* argv[]) {
   (void)argc;
   (void)argv;
 
+  /* devd 后台运行时 stdout 是文件，默认块缓冲会把日志卡在 FILE 缓冲里；
+   * 调试期改成无缓冲，/etc/run.err 能实时看到每一条。 */
+  setvbuf(stdout, NULL, _IONBF, 0);
+
   /* 带上构建时间戳：调试期间"输出没变化"经常是因为新二进制没部署，
    * 有了这一行，每次看第一行就能确认跑的是哪一版。 */
   printf("gpud: starting (build %s %s)\n", __DATE__, __TIME__);

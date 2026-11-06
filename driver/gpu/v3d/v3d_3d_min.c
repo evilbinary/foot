@@ -1356,10 +1356,14 @@ static uint32_t build_draw_rcl(uint32_t fb_iova, uint32_t stride_bytes,
 uint32_t v3d_3d_cl_base(void) { return _cl_p; }
 
 int v3d_3d_submit_cl(uint32_t bcl_start, uint32_t bcl_end,
-                     uint32_t rcl_start, uint32_t rcl_end, uint32_t w,
-                     uint32_t h) {
+                     uint32_t rcl_start, uint32_t rcl_end,
+                     uint32_t qma, uint32_t qms, uint32_t qts,
+                     uint32_t w, uint32_t h) {
   volatile uint32_t* core;
   uint32_t bfc0, rfc0;
+  uint32_t pool = qma ? qma : _pool_p;
+  uint32_t pool_size = qms ? qms : V3D_3D_POOL_SIZE;
+  uint32_t tsda = qts ? qts : _tsda_p;
   int rcb, rcr;
   (void)w;
   (void)h;
@@ -1376,10 +1380,10 @@ int v3d_3d_submit_cl(uint32_t bcl_start, uint32_t bcl_end,
 
   /* ---- bin ---- */
   bfc0 = core[CLE_BFC / 4];
-  core[CLE_CT0CS / 4] = 0;
-  core[CLE_CT0QMA / 4] = _pool_p;
-  core[CLE_CT0QMS / 4] = V3D_3D_POOL_SIZE;
-  core[CLE_CT0QTS / 4] = (1u << 1) | _tsda_p;
+  /* 不写 CT0CS（同 submit_bin）：Linux 只写 QMA/QMS/QTS/QBA/QEA。 */
+  core[CLE_CT0QMA / 4] = pool;
+  core[CLE_CT0QMS / 4] = pool_size;
+  core[CLE_CT0QTS / 4] = (1u << 1) | tsda;
   core[PTB_BPOS / 4] = 0;
   __asm__ __volatile__("dsb sy" ::: "memory");
   v3d_g2d_l2_invalidate_all();
@@ -1391,11 +1395,15 @@ int v3d_3d_submit_cl(uint32_t bcl_start, uint32_t bcl_end,
     slog("v3d_3d: submit_cl BIN timeout bfc %u->%u ct0ca 0x%x ct0cs 0x%x\r\n",
          bfc0, core[CLE_BFC / 4], core[CLE_CT0CA / 4],
          core[CLE_CT0CS / 4]);
+  } else {
+    printf("v3d_3d: submit_cl BIN ok bfc %u->%u ct0ca 0x%x bpca 0x%x bpcs 0x%x\n",
+           bfc0, core[CLE_BFC / 4], core[CLE_CT0CA / 4],
+           core[PTB_BPCA / 4], core[PTB_BPCS / 4]);
   }
 
   /* ---- render ---- */
   rfc0 = core[CLE_RFC / 4];
-  core[CLE_CT1CS / 4] = 0;
+  /* 不写 CT1CS（同 submit_render_ex）：写 0 会留下假 CA 残值。 */
   __asm__ __volatile__("dsb sy" ::: "memory");
   v3d_g2d_l2_invalidate_all();
   core[CLE_CT1QBA / 4] = rcl_start;
@@ -1406,6 +1414,10 @@ int v3d_3d_submit_cl(uint32_t bcl_start, uint32_t bcl_end,
     slog("v3d_3d: submit_cl RENDER timeout rfc %u->%u ct1ca 0x%x ct1cs 0x%x\r\n",
          rfc0, core[CLE_RFC / 4], core[CLE_CT1CA / 4],
          core[CLE_CT1CS / 4]);
+  } else {
+    printf("v3d_3d: submit_cl RENDER ok rfc %u->%u ct1ca 0x%x ct1cs 0x%x int_sts 0x%x\n",
+           rfc0, core[CLE_RFC / 4], core[CLE_CT1CA / 4],
+           core[CLE_CT1CS / 4], core[V3D_INT_STS / 4]);
   }
 
   v3d_g2d_op_end();
