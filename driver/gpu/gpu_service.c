@@ -62,6 +62,10 @@ static void* gpu_service_fn(void* fn, void* args) {
       unsigned int param = args ? *(unsigned int*)args : 0xffffffffu;
       return (void*)(long)(g_be->screen_param ? g_be->screen_param(param) : -1);
     }
+    case GPU_LOW_PRESENT:
+      return (void*)(long)(g_be->present_frame
+                               ? g_be->present_frame(args)
+                               : -1);
 
     default:
       return (void*)(long)-1;

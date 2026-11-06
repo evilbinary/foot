@@ -43,6 +43,7 @@ enum gpu_fn_low {
   GPU_LOW_WAIT_BO = 130,
   GPU_LOW_SCREEN_INFO = 140,
   GPU_LOW_SCREEN_PARAM = 141,
+  GPU_LOW_PRESENT = 142, /* 应用像素 BO -> 屏幕（默认 direct，可选 tfu） */
 };
 
 /* ---- BO（GPU 内存对象）----
@@ -154,6 +155,19 @@ typedef struct {
   unsigned int flags;
 } gpu_present_req;
 
+/* 低层上屏：应用已经把自己的像素放进一个 GPU BO，gpud 负责贴到屏幕上。
+ * mode: 0/default = direct，1 = tfu。src_fmt: GPU_FMT_RGB565 时走
+ * 直拷（TFU 直接写屏幕）；其它格式走转换路径。 */
+typedef struct {
+  unsigned int src_handle; /* BO_CREATE 返回的句柄 */
+  unsigned int src_offset; /* BO 内字节偏移 */
+  unsigned int w, h;
+  unsigned int src_fmt;    /* GPU_FMT_* */
+  unsigned int dst_x, dst_y;
+  unsigned int mode;       /* gpu_present_mode_t */
+  unsigned int flags;
+} gpu_present_frame_req;
+
 /* ---- CL 提交（Mesa 桥接用，对齐 V3D_SUBMIT_CL 的最小集）----
  * CL 由应用侧（Mesa）生成，放在 BO 里；handle==0 表示用 gpud 内部
  * 自建的测试 CL（此时 start/end 是相对内部 CL 缓冲的偏移）。 */
@@ -221,6 +235,7 @@ typedef struct gpu_backend {
   int (*sync)(void* args); /* 等 GPU 空闲 */
   int (*alpha)(void* args);   /* args = gpu_alpha_req* */
   int (*present)(void* args); /* args = gpu_present_req* */
+  int (*present_frame)(void* args); /* args = gpu_present_frame_req* */
 
   /* 低层：不支持则置 NULL */
   int (*bo_create)(void* args); /* 导入已有 pa，返回 handle */

@@ -1314,6 +1314,45 @@ static int v3d_submit_tfu(void* args) {
  * 32 的倍数。宽度不对齐时补齐会多读源数据，而源 stride 未知（BO 里
  * 没记录），紧凑布局下会越界 —— 所以这里直接拒绝，由调用方保证对齐
  * （1920 宽的整屏画布天然满足）。 */
+static int v3d_present_frame(void* args);
+
+static int v3d_present_frame(void* args) {
+  gpu_present_frame_req* r = (gpu_present_frame_req*)args;
+  if (r == NULL || r->w == 0 || r->h == 0 || r->src_handle == 0) {
+    return -1;
+  }
+  if (!g_screen.inited) {
+    return -2;
+  }
+  int i = (int)r->src_handle - 1;
+  if (i < 0 || i >= V3D_MAX_BOS || !g_bos[i].in_use) {
+    return -2;
+  }
+
+  uint32_t dst_stride_px = g_screen.pitch / g_screen.cpp;
+  uint32_t dst = FB_GVA +
+                 (r->dst_y * dst_stride_px + r->dst_x) * g_screen.cpp;
+
+  if (r->src_fmt == GPU_FMT_RGB565) {
+    /* 默认 direct：源已经是屏幕格式，TFU 直接 DMA 到屏幕扫描缓冲，
+     * 不做任何离屏转换/中转。mode 对同格式路径没有区别。 */
+    return v3d_tfu_copy_ex(&g_dev, g_bos[i].gva + r->src_offset, dst, r->w,
+                           r->h, r->w, dst_stride_px,
+                           V3D_TEX_FORMAT_RGB565);
+  }
+
+  /* ARGB8888 等：交给高层 present 的转换路径（g2d 转 RGB565 + TFU）。 */
+  gpu_present_req pr;
+  memset(&pr, 0, sizeof(pr));
+  pr.src = r->src_handle;
+  pr.w = r->w;
+  pr.h = r->h;
+  pr.dx = r->dst_x;
+  pr.dy = r->dst_y;
+  pr.src_fmt = 0; /* ARGB8888 */
+  return v3d_present(&pr);
+}
+
 static int v3d_present(void* args) {
   gpu_present_req* r = (gpu_present_req*)args;
   if (r == NULL || r->w == 0 || r->h == 0 || r->src == 0) {
@@ -1478,6 +1517,7 @@ const gpu_backend_t v3d_backend = {
     .sync = v3d_sync,
     .alpha = v3d_alpha,
     .present = v3d_present,
+    .present_frame = v3d_present_frame,
     /* 低层：BO 管理已实现；SUBMIT_CL/CSD 随阶段推进补 */
     .bo_create = v3d_bo_create,
     .bo_mmap = NULL, /* CPU 映射在应用侧（foot_cap_alloc_frame） */
